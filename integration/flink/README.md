@@ -60,6 +60,53 @@ including generated fields with no inputs. Dependency edges carry `DIRECT` or
 `INDIRECT`; they do not claim per-edge transformation subtypes that Flink's model
 does not provide.
 
+### Long SQL session acceptance fixture
+
+`flink2/src/test/resources/column-lineage/long-session.sql` contains a synthetic
+commerce session: catalog/database selection, a SQL-registered two-argument UDF,
+JSON_VALUE and CAST, three temporary views, filtering, a customer join and two
+StatementSet outputs. `ColumnLineageLongSessionE2ETest` supplies six orders and
+three customers, registers an in-memory catalog, sets Asia/Shanghai through the
+Table API, substitutes test data IDs and executes the statements in order.
+The marker-based loader is specific to this fixture, not a general SQL Client
+or SQL Gateway script parser. The two INSERT statements are added to one
+StatementSet before execution.
+
+Run from this directory after installing the paired Flink artifacts:
+
+```shell
+./gradlew :flink2:test --tests '*ColumnLineageLongSessionE2ETest'
+```
+
+The five tests check direct batch execution, direct streaming execution,
+batch and streaming compiled-plan restore from disk after dropping all three temporary views, and
+rejection of a streaming plan with its column-lineage metadata removed. Expected
+data and field dependencies are hand-derived, not generated from the converter.
+The detail sink must contain `(1, gold, 105)`, `(4, silver, 305)` and
+`(6, gold, 55)`; final summary rows must be `(gold, 160, 2)` and
+`(silver, 305, 1)`. All six output fields are checked for exact DIRECT/INDIRECT
+input sets. The summary sink accepts changelog updates in streaming mode.
+
+Successful per-path events are retained under
+`flink2/build/long-session-lineage/{direct-batch,direct-stream,restored-batch,restored-stream}.events.jsonl`;
+the streaming and batch plans are saved alongside them as `compiled-plan.json`
+and `compiled-batch-plan.json`.
+These are synthetic test artifacts, not production data or a deployable UDF Jar.
+
+**Batch restore repair (2026-09-05):** the paired Flink source now registers
+`BatchExecAdaptiveJoin` with versioned metadata and JSON serialization/restore
+support. Before this repair the batch restore test failed with `Missing type`.
+Rebuild and install that paired Planner before running these tests; an older
+2.4-SNAPSHOT artifact without the repair is insufficient. The batch test asserts
+that the saved plan still contains `batch-exec-adaptive-join_1`, then restores it
+from disk and checks actual data and all field dependencies. No adaptive optimizer
+setting is disabled. This is compiled-plan recovery, not checkpoint/savepoint recovery.
+
+This verifies flattened source-to-sink dependencies, not separate temporary-view
+nodes. JSON_VALUE operates on a STRING payload; this does not establish support
+for nested ROW field access, arbitrary UDF internals, external UDF Jar loading,
+real Kafka/Paimon connectors, remote transport delivery or SQL Gateway deployment.
+
 ----
 SPDX-License-Identifier: Apache-2.0\
 Copyright 2018-2026 contributors to the OpenLineage project
