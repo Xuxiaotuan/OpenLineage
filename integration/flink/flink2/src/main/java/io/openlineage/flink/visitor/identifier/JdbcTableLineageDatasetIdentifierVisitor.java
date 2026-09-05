@@ -15,9 +15,8 @@ import java.util.Properties;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.table.catalog.CatalogBaseTable;
-import org.apache.flink.table.planner.lineage.TableLineageDataset;
 
-/** Class to extract dataset identifier from {@link TableLineageDataset}. */
+/** Class to extract dataset identifier from a Flink table lineage dataset. */
 @Slf4j
 public class JdbcTableLineageDatasetIdentifierVisitor implements DatasetIdentifierVisitor {
   private static final String JDBC_CONNECTOR = "jdbc";

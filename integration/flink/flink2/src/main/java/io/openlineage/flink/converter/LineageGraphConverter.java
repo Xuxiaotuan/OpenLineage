@@ -13,6 +13,7 @@ import io.openlineage.flink.client.Versions;
 import io.openlineage.flink.facets.FlinkJobDetailsFacet;
 import io.openlineage.flink.visitor.Flink2VisitorFactory;
 import java.time.ZonedDateTime;
+import java.util.Collections;
 import org.apache.flink.runtime.util.EnvironmentInformation;
 import org.apache.flink.streaming.api.lineage.LineageGraph;
 
@@ -54,7 +55,9 @@ public class LineageGraphConverter {
                         .build())
                 .build())
         .inputs(datasetExtractor.extractInputs(graph))
-        .outputs(datasetExtractor.extractOutputs(graph))
+        .outputs(
+            datasetExtractor.extractOutputs(
+                graph, graph == null ? Collections.emptyList() : graph.columnRelations()))
         .build();
   }
 

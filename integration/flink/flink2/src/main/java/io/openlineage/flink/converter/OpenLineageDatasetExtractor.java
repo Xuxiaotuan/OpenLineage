@@ -6,8 +6,13 @@
 package io.openlineage.flink.converter;
 
 import io.openlineage.client.OpenLineage;
+import io.openlineage.client.OpenLineage.ColumnLineageDatasetFacet;
+import io.openlineage.client.OpenLineage.ColumnLineageDatasetFacetFieldsBuilder;
 import io.openlineage.client.OpenLineage.DatasetFacetsBuilder;
 import io.openlineage.client.OpenLineage.InputDataset;
+import io.openlineage.client.OpenLineage.InputField;
+import io.openlineage.client.OpenLineage.InputFieldTransformations;
+import io.openlineage.client.OpenLineage.InputFieldTransformationsBuilder;
 import io.openlineage.client.OpenLineage.OutputDataset;
 import io.openlineage.client.dataset.namespace.resolver.DatasetNamespaceCombinedResolver;
 import io.openlineage.client.utils.DatasetIdentifier;
@@ -15,10 +20,15 @@ import io.openlineage.flink.api.OpenLineageContext;
 import io.openlineage.flink.visitor.Flink2VisitorFactory;
 import io.openlineage.flink.visitor.facet.DatasetFacetVisitor;
 import io.openlineage.flink.visitor.identifier.DatasetIdentifierVisitor;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
+import org.apache.flink.streaming.api.lineage.ColumnLineageInput;
+import org.apache.flink.streaming.api.lineage.ColumnLineageRelation;
 import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.streaming.api.lineage.LineageGraph;
 
@@ -56,6 +66,11 @@ class OpenLineageDatasetExtractor {
   }
 
   List<OutputDataset> extractOutputs(LineageGraph graph) {
+    return extractOutputs(graph, Collections.emptyList());
+  }
+
+  List<OutputDataset> extractOutputs(
+      LineageGraph graph, List<ColumnLineageRelation> columnRelations) {
     if (graph == null) {
       return Collections.emptyList();
     }
@@ -70,12 +85,17 @@ class OpenLineageDatasetExtractor {
                     .newOutputDatasetBuilder()
                     .namespace(d.getDatasetIdentifier().getNamespace())
                     .name(d.getDatasetIdentifier().getName())
-                    .facets(convert(d))
+                    .facets(convert(d, columnRelations))
                     .build())
         .collect(Collectors.toList());
   }
 
   private OpenLineage.DatasetFacets convert(LineageDatasetWithIdentifier dataset) {
+    return convert(dataset, Collections.emptyList());
+  }
+
+  private OpenLineage.DatasetFacets convert(
+      LineageDatasetWithIdentifier dataset, List<ColumnLineageRelation> columnRelations) {
     DatasetFacetsBuilder facetsBuilder = new DatasetFacetsBuilder();
 
     if (dataset.getDatasetIdentifier().getSymlinks() != null) {
@@ -97,7 +117,83 @@ class OpenLineageDatasetExtractor {
         .filter(v -> v.isDefinedAt(dataset))
         .forEach(v -> v.apply(dataset, facetsBuilder));
 
+    buildColumnLineageFacet(dataset.getFlinkDataset(), columnRelations)
+        .ifPresent(facetsBuilder::columnLineage);
+
     return facetsBuilder.build();
+  }
+
+  private Optional<ColumnLineageDatasetFacet> buildColumnLineageFacet(
+      LineageDataset outputDataset, List<ColumnLineageRelation> columnRelations) {
+    List<ColumnLineageRelation> outputRelations =
+        columnRelations.stream()
+            .filter(relation -> sameDataset(relation.outputDataset(), outputDataset))
+            .collect(Collectors.toList());
+    if (outputRelations.isEmpty()) {
+      return Optional.empty();
+    }
+
+    ColumnLineageDatasetFacetFieldsBuilder fieldsBuilder =
+        context.getOpenLineage().newColumnLineageDatasetFacetFieldsBuilder();
+    for (ColumnLineageRelation relation : outputRelations) {
+      fieldsBuilder.put(
+          relation.outputField(),
+          context
+              .getOpenLineage()
+              .newColumnLineageDatasetFacetFieldsAdditionalBuilder()
+              .inputFields(inputFields(relation))
+              // Flink's description applies to the output as a whole, not each dependency edge.
+              // This standard field retains that scope, including outputs without input fields.
+              .transformationDescription(relation.transformation().orElse(null))
+              .build());
+    }
+    return Optional.of(
+        context
+            .getOpenLineage()
+            .newColumnLineageDatasetFacetBuilder()
+            .fields(fieldsBuilder.build())
+            .build());
+  }
+
+  private List<InputField> inputFields(ColumnLineageRelation relation) {
+    List<InputField> inputFields = new ArrayList<>();
+    for (ColumnLineageInput input : relation.inputs()) {
+      Collection<LineageDatasetWithIdentifier> datasets =
+          extractDatasetsWithIdentifiers(input.inputDataset());
+      if (datasets.isEmpty()) {
+        throw new IllegalStateException(
+            String.format(
+                "Cannot convert column lineage for sink dataset '%s.%s', output field '%s': "
+                    + "input dataset '%s.%s', field '%s' has no OpenLineage identifier",
+                relation.outputDataset().namespace(),
+                relation.outputDataset().name(),
+                relation.outputField(),
+                input.inputDataset().namespace(),
+                input.inputDataset().name(),
+                input.inputField()));
+      }
+      datasets.forEach(dataset -> inputFields.add(inputField(dataset, input)));
+    }
+    return inputFields;
+  }
+
+  private boolean sameDataset(LineageDataset first, LineageDataset second) {
+    return Objects.equals(first.namespace(), second.namespace())
+        && Objects.equals(first.name(), second.name());
+  }
+
+  private InputField inputField(LineageDatasetWithIdentifier dataset, ColumnLineageInput input) {
+    InputFieldTransformationsBuilder transformationBuilder =
+        new InputFieldTransformationsBuilder().type(input.dependencyType().name());
+    InputFieldTransformations transformation = transformationBuilder.build();
+    return context
+        .getOpenLineage()
+        .newInputFieldBuilder()
+        .namespace(dataset.getDatasetIdentifier().getNamespace())
+        .name(dataset.getDatasetIdentifier().getName())
+        .field(input.inputField())
+        .transformations(Collections.singletonList(transformation))
+        .build();
   }
 
   private Collection<LineageDatasetWithIdentifier> extractDatasetsWithIdentifiers(

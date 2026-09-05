@@ -6,9 +6,12 @@
 package io.openlineage.flink.converter;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.openlineage.client.OpenLineage;
 import io.openlineage.client.OpenLineage.DatasetFacet;
 import io.openlineage.client.OpenLineage.DatasetFacetsBuilder;
@@ -17,6 +20,7 @@ import io.openlineage.client.OpenLineage.JobTypeJobFacet;
 import io.openlineage.client.OpenLineage.OutputDataset;
 import io.openlineage.client.OpenLineage.OwnershipJobFacetOwners;
 import io.openlineage.client.OpenLineage.RunEvent.EventType;
+import io.openlineage.client.OpenLineageClientUtils;
 import io.openlineage.client.job.JobConfig;
 import io.openlineage.client.utils.DatasetIdentifier;
 import io.openlineage.client.utils.DatasetIdentifier.Symlink;
@@ -33,9 +37,14 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.flink.api.connector.source.Boundedness;
+import org.apache.flink.streaming.api.lineage.ColumnLineageDependencyType;
+import org.apache.flink.streaming.api.lineage.ColumnLineageInput;
+import org.apache.flink.streaming.api.lineage.ColumnLineageOrigin;
+import org.apache.flink.streaming.api.lineage.ColumnLineageRelation;
 import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.streaming.api.lineage.LineageDatasetFacet;
 import org.apache.flink.streaming.api.lineage.LineageGraph;
@@ -192,6 +201,384 @@ class LineageGraphConverterTest {
         .hasFieldOrPropertyWithValue("type", "TABLE");
   }
 
+  @Test
+  void keepsOutputTransformationOffIndividualInputEdges() throws Exception {
+    LineageDataset source = lineageDatasetOf("orders", "warehouse").getFlinkDataset();
+    LineageDataset sink = lineageDatasetOf("totals", "warehouse").getFlinkDataset();
+    when(graph.sources()).thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(source))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(sink)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    sink,
+                    "total",
+                    List.of(
+                        inputOf(source, "amount", ColumnLineageDependencyType.DIRECT),
+                        inputOf(source, "region", ColumnLineageDependencyType.INDIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    "AGGREGATION,GROUP_BY")));
+    JsonNode field =
+        outputsJson().get(0).path("facets").path("columnLineage").path("fields").path("total");
+    assertThat(field.path("transformationDescription").asText()).isEqualTo("AGGREGATION,GROUP_BY");
+    for (JsonNode input : field.path("inputFields")) {
+      assertThat(input.path("transformations").get(0).has("description")).isFalse();
+    }
+  }
+
+  @Test
+  void convertsDirectAndIndirectMultipleInputFieldsIntoColumnLineageJson() throws Exception {
+    LineageDataset orders = lineageDatasetOf("orders", "warehouse").getFlinkDataset();
+    LineageDataset customers = lineageDatasetOf("customers", "warehouse").getFlinkDataset();
+    LineageDataset totals = lineageDatasetOf("daily_totals", "warehouse").getFlinkDataset();
+
+    when(graph.sources())
+        .thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(orders, customers))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(totals)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    totals,
+                    "total",
+                    List.of(
+                        inputOf(orders, "amount", ColumnLineageDependencyType.DIRECT),
+                        inputOf(customers, "tier", ColumnLineageDependencyType.INDIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    "amount * tier_multiplier")));
+
+    assertThat(outputsJson())
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"warehouse\",\"name\":\"daily_totals\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"total\":{\"transformationDescription\":\"amount * tier_multiplier\",\"inputFields\":["
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders\",\"field\":\"amount\","
+                        + "\"transformations\":[{\"type\":\"DIRECT\"}]},"
+                        + "{\"namespace\":\"warehouse\",\"name\":\"customers\",\"field\":\"tier\","
+                        + "\"transformations\":[{\"type\":\"INDIRECT\"}]}]}}}}}]"));
+  }
+
+  @Test
+  void convertsConstantOutputFieldIntoAnEmptyColumnLineageInputList() throws Exception {
+    LineageDataset constants = lineageDatasetOf("constants", "warehouse").getFlinkDataset();
+
+    when(graph.sources()).thenReturn(Collections.emptyList());
+    when(graph.sinks()).thenReturn(List.of(vertexOf(constants)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    constants,
+                    "source_system",
+                    Collections.emptyList(),
+                    ColumnLineageOrigin.CONSTANT,
+                    null)));
+
+    assertThat(outputsJson())
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"warehouse\",\"name\":\"constants\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"source_system\":{\"inputFields\":[]}}}}}]"));
+  }
+
+  @Test
+  void convertsConstantOutputFieldIndirectFilterDependencyIntoColumnLineageJson() throws Exception {
+    LineageDataset orders = lineageDatasetOf("orders", "warehouse").getFlinkDataset();
+    LineageDataset constants = lineageDatasetOf("constants", "warehouse").getFlinkDataset();
+
+    when(graph.sources()).thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(orders))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(constants)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    constants,
+                    "source_system",
+                    List.of(inputOf(orders, "is_current", ColumnLineageDependencyType.INDIRECT)),
+                    ColumnLineageOrigin.CONSTANT,
+                    "WHERE is_current")));
+
+    assertThat(outputsJson())
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"warehouse\",\"name\":\"constants\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"source_system\":{\"transformationDescription\":\"WHERE is_current\",\"inputFields\":["
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders\",\"field\":\"is_current\","
+                        + "\"transformations\":[{\"type\":\"INDIRECT\"}]}]}}}}}]"));
+  }
+
+  @Test
+  void createsSeparateColumnLineageFacetsForMultipleSinks() throws Exception {
+    LineageDataset source = lineageDatasetOf("orders", "warehouse").getFlinkDataset();
+    LineageDataset daily = lineageDatasetOf("daily_orders", "warehouse").getFlinkDataset();
+    LineageDataset monthly = lineageDatasetOf("monthly_orders", "warehouse").getFlinkDataset();
+
+    when(graph.sources()).thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(source))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(daily), vertexOf(monthly)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    daily,
+                    "order_id",
+                    List.of(inputOf(source, "id", ColumnLineageDependencyType.DIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    null),
+                relationOf(
+                    monthly,
+                    "order_count",
+                    List.of(inputOf(source, "id", ColumnLineageDependencyType.INDIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    "COUNT(id)")));
+
+    assertThat(outputsJson())
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"warehouse\",\"name\":\"daily_orders\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"order_id\":{\"inputFields\":["
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders\",\"field\":\"id\","
+                        + "\"transformations\":[{\"type\":\"DIRECT\"}]}]}}}}},"
+                        + "{\"namespace\":\"warehouse\",\"name\":\"monthly_orders\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"order_count\":{\"transformationDescription\":\"COUNT(id)\",\"inputFields\":["
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders\",\"field\":\"id\","
+                        + "\"transformations\":[{\"type\":\"INDIRECT\"}]}]}}}}}]"));
+  }
+
+  @Test
+  void matchesColumnRelationToSinkByStableDatasetIdentity() throws Exception {
+    LineageDataset source = lineageDatasetOf("orders", "warehouse").getFlinkDataset();
+    LineageDataset sinkDataset = lineageDatasetOf("daily_orders", "warehouse").getFlinkDataset();
+    LineageDataset relationDataset =
+        lineageDatasetOf("daily_orders", "warehouse").getFlinkDataset();
+
+    when(graph.sources()).thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(source))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(sinkDataset)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    relationDataset,
+                    "order_id",
+                    List.of(inputOf(source, "id", ColumnLineageDependencyType.DIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    null)));
+
+    assertThat(outputsJson())
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"warehouse\",\"name\":\"daily_orders\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"order_id\":{\"inputFields\":["
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders\",\"field\":\"id\","
+                        + "\"transformations\":[{\"type\":\"DIRECT\"}]}]}}}}}]"));
+  }
+
+  @Test
+  void convertsNullGraphWithoutColumnLineageLookup() {
+    assertThat(converter.convert(null, EventType.START).getInputs()).isEmpty();
+    assertThat(converter.convert(null, EventType.START).getOutputs()).isEmpty();
+  }
+
+  @Test
+  void rejectsInputFieldWithoutAnOpenLineageDatasetIdentifier() {
+    LineageDataset source = lineageDatasetOf("orders", "warehouse").getFlinkDataset();
+    LineageDataset sink = lineageDatasetOf("daily_orders", "warehouse").getFlinkDataset();
+
+    when(visitorFactory.loadDatasetIdentifierVisitors(context))
+        .thenReturn(List.of(new EmptyDatasetIdentifierVisitor(source)));
+    converter = new LineageGraphConverter(context, visitorFactory);
+    when(graph.sources()).thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(source))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(sink)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    sink,
+                    "order_id",
+                    List.of(inputOf(source, "id", ColumnLineageDependencyType.DIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    null)));
+
+    assertThatThrownBy(() -> converter.convert(graph, EventType.START))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("daily_orders")
+        .hasMessageContaining("order_id")
+        .hasMessageContaining("orders")
+        .hasMessageContaining("id");
+  }
+
+  @Test
+  void preservesMultipleOpenLineageIdentifiersForOneInputField() throws Exception {
+    LineageDataset source = lineageDatasetOf("orders", "warehouse").getFlinkDataset();
+    LineageDataset sink = lineageDatasetOf("daily_orders", "warehouse").getFlinkDataset();
+
+    when(visitorFactory.loadDatasetIdentifierVisitors(context))
+        .thenReturn(
+            List.of(
+                new MultipleDatasetIdentifierVisitor(
+                    source,
+                    List.of(
+                        new DatasetIdentifier("orders_primary", "warehouse"),
+                        new DatasetIdentifier("orders_replica", "warehouse")))));
+    converter = new LineageGraphConverter(context, visitorFactory);
+    when(graph.sources()).thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(source))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(sink)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    sink,
+                    "order_id",
+                    List.of(inputOf(source, "id", ColumnLineageDependencyType.DIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    null)));
+
+    assertThat(outputsJson())
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"warehouse\",\"name\":\"daily_orders\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"order_id\":{\"inputFields\":["
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders_primary\",\"field\":\"id\","
+                        + "\"transformations\":[{\"type\":\"DIRECT\"}]},"
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders_replica\",\"field\":\"id\","
+                        + "\"transformations\":[{\"type\":\"DIRECT\"}]}]}}}}}]"));
+  }
+
+  @Test
+  void convertsSystemOutputFieldIntoAnEmptyColumnLineageInputList() throws Exception {
+    LineageDataset systemOutput = lineageDatasetOf("audit", "warehouse").getFlinkDataset();
+
+    when(graph.sources()).thenReturn(Collections.emptyList());
+    when(graph.sinks()).thenReturn(List.of(vertexOf(systemOutput)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    systemOutput,
+                    "processed_at",
+                    Collections.emptyList(),
+                    ColumnLineageOrigin.SYSTEM,
+                    "CURRENT_TIMESTAMP")));
+
+    assertThat(outputsJson())
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"warehouse\",\"name\":\"audit\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"processed_at\":{\"transformationDescription\":\"CURRENT_TIMESTAMP\",\"inputFields\":[]}}}}}]"));
+  }
+
+  @Test
+  void convertsSystemOutputFieldIndirectGroupAndFilterDependenciesIntoColumnLineageJson()
+      throws Exception {
+    LineageDataset orders = lineageDatasetOf("orders", "warehouse").getFlinkDataset();
+    LineageDataset systemOutput = lineageDatasetOf("audit", "warehouse").getFlinkDataset();
+
+    when(graph.sources()).thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(orders))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(systemOutput)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    systemOutput,
+                    "processed_at",
+                    List.of(
+                        inputOf(orders, "region", ColumnLineageDependencyType.INDIRECT),
+                        inputOf(orders, "is_current", ColumnLineageDependencyType.INDIRECT)),
+                    ColumnLineageOrigin.SYSTEM,
+                    "GROUP BY region; FILTER is_current")));
+
+    assertThat(outputsJson())
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"warehouse\",\"name\":\"audit\",\"facets\":{"
+                        + "\"columnLineage\":{\"fields\":{\"processed_at\":{\"transformationDescription\":\"GROUP BY region; FILTER is_current\",\"inputFields\":["
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders\",\"field\":\"region\","
+                        + "\"transformations\":[{\"type\":\"INDIRECT\"}]},"
+                        + "{\"namespace\":\"warehouse\",\"name\":\"orders\",\"field\":\"is_current\","
+                        + "\"transformations\":[{\"type\":\"INDIRECT\"}]}]}}}}}]"));
+  }
+
+  private JsonNode outputsJson() throws Exception {
+    JsonNode outputs =
+        OpenLineageClientUtils.newObjectMapper()
+            .readTree(
+                OpenLineageClientUtils.newObjectMapper()
+                    .writeValueAsString(converter.convert(graph, EventType.START).getOutputs()));
+    for (JsonNode output : outputs) {
+      ObjectNode facets = (ObjectNode) output.get("facets");
+      ObjectNode columnLineage = (ObjectNode) facets.get("columnLineage");
+      columnLineage.remove(List.of("_producer", "_schemaURL"));
+      JsonNode symlinks = facets.get("symlinks");
+      if (symlinks != null
+          && symlinks.path("identifiers").isArray()
+          && symlinks.path("identifiers").isEmpty()) {
+        facets.remove("symlinks");
+      }
+    }
+    return outputs;
+  }
+
+  private ColumnLineageRelation relationOf(
+      LineageDataset outputDataset,
+      String outputField,
+      List<ColumnLineageInput> inputs,
+      ColumnLineageOrigin origin,
+      String transformation) {
+    return new ColumnLineageRelation() {
+      @Override
+      public LineageDataset outputDataset() {
+        return outputDataset;
+      }
+
+      @Override
+      public String outputField() {
+        return outputField;
+      }
+
+      @Override
+      public List<ColumnLineageInput> inputs() {
+        return inputs;
+      }
+
+      @Override
+      public ColumnLineageOrigin origin() {
+        return origin;
+      }
+
+      @Override
+      public Optional<String> transformation() {
+        return Optional.ofNullable(transformation);
+      }
+    };
+  }
+
+  private ColumnLineageInput inputOf(
+      LineageDataset dataset, String field, ColumnLineageDependencyType dependencyType) {
+    return new ColumnLineageInput() {
+      @Override
+      public LineageDataset inputDataset() {
+        return dataset;
+      }
+
+      @Override
+      public String inputField() {
+        return field;
+      }
+
+      @Override
+      public ColumnLineageDependencyType dependencyType() {
+        return dependencyType;
+      }
+    };
+  }
+
   private LineageDatasetWithIdentifier lineageDatasetOf(String name, String namespace) {
     return new LineageDatasetWithIdentifier(
         new DatasetIdentifier(name, namespace),
@@ -224,6 +611,15 @@ class LineageGraphConverterTest {
       @Override
       public List<LineageDataset> datasets() {
         return datasets;
+      }
+    };
+  }
+
+  private LineageVertex vertexOf(LineageDataset dataset) {
+    return new LineageVertex() {
+      @Override
+      public List<LineageDataset> datasets() {
+        return List.of(dataset);
       }
     };
   }
@@ -261,6 +657,45 @@ class LineageGraphConverterTest {
               "namespace",
               Arrays.asList(new Symlink("table1", "namespace", SymlinkType.TABLE))),
           new DatasetIdentifier("datasetName2", "namespace"));
+    }
+  }
+
+  private static class EmptyDatasetIdentifierVisitor implements DatasetIdentifierVisitor {
+    private final LineageDataset dataset;
+
+    private EmptyDatasetIdentifierVisitor(LineageDataset dataset) {
+      this.dataset = dataset;
+    }
+
+    @Override
+    public boolean isDefinedAt(LineageDataset candidate) {
+      return dataset == candidate;
+    }
+
+    @Override
+    public Collection<DatasetIdentifier> apply(LineageDataset candidate) {
+      return Collections.emptyList();
+    }
+  }
+
+  private static class MultipleDatasetIdentifierVisitor implements DatasetIdentifierVisitor {
+    private final LineageDataset dataset;
+    private final List<DatasetIdentifier> identifiers;
+
+    private MultipleDatasetIdentifierVisitor(
+        LineageDataset dataset, List<DatasetIdentifier> identifiers) {
+      this.dataset = dataset;
+      this.identifiers = identifiers;
+    }
+
+    @Override
+    public boolean isDefinedAt(LineageDataset candidate) {
+      return dataset == candidate;
+    }
+
+    @Override
+    public Collection<DatasetIdentifier> apply(LineageDataset candidate) {
+      return identifiers;
     }
   }
 }

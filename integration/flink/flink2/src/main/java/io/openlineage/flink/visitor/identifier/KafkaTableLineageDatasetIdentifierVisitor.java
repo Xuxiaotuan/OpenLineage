@@ -17,9 +17,8 @@ import java.util.Set;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.table.catalog.CatalogBaseTable;
-import org.apache.flink.table.planner.lineage.TableLineageDataset;
 
-/** Class to extract dataset identifier from {@link TableLineageDataset} stored on Kafka. */
+/** Class to extract dataset identifier from a Flink table lineage dataset stored on Kafka. */
 @Slf4j
 public class KafkaTableLineageDatasetIdentifierVisitor implements DatasetIdentifierVisitor {
   private static final Set<String> KAFKA_CONNECTORS = Set.of("kafka", "upsert-kafka");

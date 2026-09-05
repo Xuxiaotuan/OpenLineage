@@ -257,8 +257,150 @@ shadowJar {
     zip64 true
 }
 
+tasks.register("verifyFlink2ColumnLineageJar") {
+    group = "verification"
+    description = "Loads the deployable jar in isolation and verifies its Flink column-lineage API boundary"
+    dependsOn shadowJar
+
+    doLast {
+        File archive = shadowJar.archiveFile.get().asFile
+        new java.util.zip.ZipFile(archive).withCloseable { jar ->
+            List<String> entries = jar.entries().collect { it.name }
+            List<String> packagedFlinkClasses = entries.findAll {
+                it.startsWith("org/apache/flink/") && it.endsWith(".class")
+            }
+            if (!packagedFlinkClasses.isEmpty()) {
+                throw new GradleException(
+                        "Deployable jar must use Flink's runtime classes, but packages: "
+                                + packagedFlinkClasses.take(10))
+            }
+
+            def classBytecode = { String className ->
+                def entry = jar.getEntry(className)
+                if (entry == null) {
+                    throw new GradleException("Deployable jar is missing ${className}")
+                }
+                return new String(
+                        jar.getInputStream(entry).bytes,
+                        java.nio.charset.StandardCharsets.ISO_8859_1)
+            }
+
+            String graphConverterBytecode = classBytecode(
+                    "io/openlineage/flink/converter/LineageGraphConverter.class")
+            String datasetExtractorBytecode = classBytecode(
+                    "io/openlineage/flink/converter/OpenLineageDatasetExtractor.class")
+            [graphConverterBytecode, datasetExtractorBytecode].each { bytecode ->
+                if (bytecode.contains("org/apache/flink/table/planner/")) {
+                    throw new GradleException(
+                            "Column-lineage conversion must not link Planner-private classes")
+                }
+            }
+
+            if (!graphConverterBytecode.contains(
+                    "org/apache/flink/streaming/api/lineage/LineageGraph")) {
+                throw new GradleException(
+                        "LineageGraphConverter does not link Flink LineageGraph")
+            }
+
+            [
+                    "org/apache/flink/streaming/api/lineage/LineageGraph",
+                    "org/apache/flink/streaming/api/lineage/ColumnLineageRelation",
+                    "org/apache/flink/streaming/api/lineage/ColumnLineageInput",
+                    "org/apache/flink/streaming/api/lineage/ColumnLineageDependencyType"
+            ].each { publicApi ->
+                if (!datasetExtractorBytecode.contains(publicApi)) {
+                    throw new GradleException(
+                            "OpenLineageDatasetExtractor does not link required Flink public API ${publicApi}")
+                }
+            }
+        }
+
+        File javap = new File(System.getProperty("java.home"), "bin/javap")
+        if (!javap.isFile()) {
+            throw new GradleException("javap is unavailable in the active Java toolchain: ${javap}")
+        }
+        def javapOutput = new ByteArrayOutputStream()
+        def javapResult = project.exec {
+            commandLine javap.absolutePath, "-classpath", archive.absolutePath, "-c", "-verbose",
+                    "io.openlineage.flink.converter.LineageGraphConverter"
+            standardOutput = javapOutput
+            errorOutput = javapOutput
+            ignoreExitValue = true
+        }
+        if (javapResult.exitValue != 0) {
+            throw new GradleException(
+                    "javap failed for LineageGraphConverter:\n${javapOutput.toString('UTF-8')}")
+        }
+        String disassembly = javapOutput.toString("UTF-8")
+        String columnRelationsInvocation =
+                "(?m)^\\s*\\d+:\\s+invokeinterface\\s+#\\d+,\\s+\\d+\\s+// InterfaceMethod " +
+                        "org/apache/flink/streaming/api/lineage/LineageGraph\\.columnRelations:" +
+                        "\\(\\)Ljava/util/List;\\s*\$"
+        if (!(disassembly =~ columnRelationsInvocation).find()) {
+            throw new GradleException(
+                    "LineageGraphConverter does not invoke the exact public method "
+                            + "LineageGraph.columnRelations:()Ljava/util/List;")
+        }
+
+        def resolvedArtifacts = project(":flink2")
+                .configurations.compileClasspath.resolvedConfiguration.resolvedArtifacts
+        def plannerArtifacts = resolvedArtifacts.findAll { artifact ->
+            [artifact.name, artifact.moduleVersion.id.name, artifact.file.name].any {
+                it.toLowerCase().contains("flink-table-planner")
+            }
+        }
+        if (!plannerArtifacts.isEmpty()) {
+            throw new GradleException(
+                    "Isolated column-lineage loader must not contain Planner artifacts: "
+                            + plannerArtifacts.collect { it.file.name })
+        }
+        List<File> externalFlinkApi = resolvedArtifacts
+                .findAll { it.moduleVersion.id.group == "org.apache.flink" }
+                .collect { it.file }
+                .findAll { it.exists() }
+                .unique()
+        if (externalFlinkApi.isEmpty()) {
+            throw new GradleException("No external Flink API jars resolved for isolated loading")
+        }
+        List<java.net.URL> runtimeUrls = ([archive] + externalFlinkApi)
+                .collect { it.toURI().toURL() }
+        new java.net.URLClassLoader(
+                runtimeUrls as java.net.URL[],
+                ClassLoader.getPlatformClassLoader()).withCloseable { isolated ->
+            Class<?> lineageGraph = Class.forName(
+                    "org.apache.flink.streaming.api.lineage.LineageGraph", false, isolated)
+            if (lineageGraph.getMethod("columnRelations").returnType != List.class) {
+                throw new GradleException("LineageGraph.columnRelations() must return java.util.List")
+            }
+            [
+                    "org.apache.flink.streaming.api.lineage.ColumnLineageRelation",
+                    "org.apache.flink.streaming.api.lineage.ColumnLineageInput",
+                    "org.apache.flink.streaming.api.lineage.ColumnLineageOrigin",
+                    "org.apache.flink.streaming.api.lineage.ColumnLineageDependencyType"
+            ].each { publicApi -> Class.forName(publicApi, false, isolated) }
+
+            Class<?> graphConverter = Class.forName(
+                    "io.openlineage.flink.converter.LineageGraphConverter", false, isolated)
+            Class<?> datasetExtractor = Class.forName(
+                    "io.openlineage.flink.converter.OpenLineageDatasetExtractor", false, isolated)
+            graphConverter.declaredMethods
+            datasetExtractor.declaredMethods
+
+            File loadedFrom = new File(graphConverter.protectionDomain.codeSource.location.toURI())
+            if (loadedFrom.canonicalFile != archive.canonicalFile) {
+                throw new GradleException(
+                        "LineageGraphConverter was not loaded from deployable jar: ${loadedFrom}")
+            }
+        }
+    }
+}
+
 assemble {
     dependsOn shadowJar
+}
+
+check {
+    dependsOn verifyFlink2ColumnLineageJar
 }
 
 spotlessJava {
