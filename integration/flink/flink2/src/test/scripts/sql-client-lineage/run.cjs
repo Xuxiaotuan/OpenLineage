@@ -26,7 +26,7 @@ function prepare(mode) {
   }
   return {dir, sql: template.replaceAll('__ROOT__', dir.replaceAll("'", "''"))};
 }
-function run(dir, name, sql, expectFailure = false) {
+function run(dir, name, sql) {
   const file = path.join(dir, name + '.sql');
   fs.writeFileSync(file, sql);
   const log = path.join(dir, name + '.log');
@@ -41,10 +41,8 @@ function run(dir, name, sql, expectFailure = false) {
   }
   assert.ifError(result.error);
   const output = fs.readFileSync(log, 'utf8');
-  if (!expectFailure) {
-    assert.equal(result.status, 0, log);
-    assert.ok(!output.includes('[ERROR]'), log);
-  }
+  assert.equal(result.status, 0, log);
+  assert.ok(!output.includes('[ERROR]'), log);
   return output;
 }
 const direct = prepare('direct');
@@ -67,20 +65,9 @@ function removeLineage(node) {
 assert.equal(removeLineage(corrupted), 1);
 const badPlan = path.join(negative.dir, 'incomplete-plan.json');
 fs.writeFileSync(badPlan, JSON.stringify(corrupted));
-const failedOutput = run(negative.dir, 'reject', negative.sql.split('CREATE TABLE Orders')[0] + "EXECUTE PLAN '" + badPlan + "';\n", true);
-assert.match(failedOutput, /compiled plan does not contain complete column lineage/);
-assert.ok(failedOutput.includes('[ERROR]'), 'SQL Client must report rejection');
-assert.ok(!failedOutput.includes('Complete execution of the SQL update statement'));
-assert.ok(!fs.existsSync(path.join(negative.dir, 'events.jsonl')));
-function hasFiles(dir) {
-  return fs.existsSync(dir) && fs.readdirSync(dir, {withFileTypes: true}).some(entry =>
-    !entry.isDirectory() || hasFiles(path.join(dir, entry.name)));
-}
-// The filesystem connector can create empty staging directories while compiling.
-for (const sink of ['detail', 'summary']) {
-  assert.ok(!hasFiles(path.join(negative.dir, sink)), 'Rejected plan must not write Sink files');
-}
-console.log('PASS: incomplete lineage rejected, no event or Sink output');
+run(negative.dir, 'incomplete', negative.sql.split('CREATE TABLE Orders')[0] + "EXECUTE PLAN '" + badPlan + "';\n");
+verify.incomplete(negative.dir);
+console.log('PASS: valid plan with incomplete lineage executes with explicit unavailable status');
 
 const restored = prepare('restored');
 const planFile = path.join(restored.dir, 'plan.json');

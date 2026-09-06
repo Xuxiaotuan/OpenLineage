@@ -49,6 +49,7 @@ import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.streaming.api.lineage.LineageDatasetFacet;
 import org.apache.flink.streaming.api.lineage.LineageEdge;
 import org.apache.flink.streaming.api.lineage.LineageGraph;
+import org.apache.flink.streaming.api.lineage.LineageGraphObservation;
 import org.apache.flink.streaming.api.lineage.LineageVertex;
 import org.apache.flink.streaming.api.lineage.SourceLineageVertex;
 import org.junit.jupiter.api.BeforeEach;
@@ -558,8 +559,74 @@ class LineageGraphConverterTest {
         .isEqualTo(
             OpenLineageClientUtils.newObjectMapper()
                 .readTree(
-                    "[{\"namespace\":\"ns\",\"name\":\"T\",\"field\":\"a\",\"transformations\":[{\"type\":\"DIRECT\"}]},"
-                        + "{\"namespace\":\"ns\",\"name\":\"T\",\"field\":\"a\",\"transformations\":[{\"type\":\"INDIRECT\"}]}]"));
+                    "[{\"namespace\":\"ns\",\"name\":\"T\",\"field\":\"a\",\"transformations\":[{\"type\":\"DIRECT\"},{\"type\":\"INDIRECT\"}]}]"));
+  }
+
+  @Test
+  void incompleteTableObservationOmitsPrecisePairsButKeepsKnownDatasets() {
+    SourceLineageVertex source =
+        sourceVertexOf(Boundedness.BOUNDED, List.of(lineageDatasetOf("A", "ns").getFlinkDataset()));
+    LineageVertex sink = vertexOf(lineageDatasetOf("X", "ns").getFlinkDataset());
+    when(graph.sources()).thenReturn(List.of(source));
+    when(graph.sinks()).thenReturn(List.of(sink));
+    when(graph.relations()).thenReturn(List.of(edgeOf(source, sink)));
+    for (String tableStatus : List.of("PARTIAL", "UNAVAILABLE")) {
+      OpenLineage.RunEvent event =
+          converter.convert(
+              new LineageGraphObservation(
+                  graph, tableStatus, "UNAVAILABLE", List.of("missing metadata")),
+              EventType.START);
+      assertThat(event.getJob().getFacets().getLineage()).isNull();
+      assertThat(event.getInputs()).extracting(InputDataset::getName).containsExactly("A");
+      assertThat(event.getOutputs()).extracting(OutputDataset::getName).containsExactly("X");
+    }
+    assertThat(
+            converter
+                .convert(
+                    new LineageGraphObservation(graph, "COMPLETE", "UNAVAILABLE", List.of()),
+                    EventType.START)
+                .getJob()
+                .getFacets()
+                .getLineage())
+        .isNotNull();
+  }
+
+  @Test
+  void sourceLessSinkHasExplicitEmptyTableInputs() throws Exception {
+    when(graph.sinks())
+        .thenReturn(List.of(vertexOf(lineageDatasetOf("constants", "ns").getFlinkDataset())));
+    JsonNode entries =
+        OpenLineageClientUtils.newObjectMapper()
+            .valueToTree(converter.convert(graph, EventType.START).getJob().getFacets())
+            .path("lineage")
+            .path("entries");
+    assertThat(entries)
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"constants\",\"inputs\":[]}]"));
+  }
+
+  @Test
+  void sourceLessSinkIsRetainedAlongsideRelatedSink() throws Exception {
+    SourceLineageVertex source =
+        sourceVertexOf(Boundedness.BOUNDED, List.of(lineageDatasetOf("A", "ns").getFlinkDataset()));
+    LineageVertex sink = vertexOf(lineageDatasetOf("X", "ns").getFlinkDataset());
+    LineageVertex constants = vertexOf(lineageDatasetOf("constants", "ns").getFlinkDataset());
+    when(graph.sources()).thenReturn(List.of(source));
+    when(graph.sinks()).thenReturn(List.of(sink, constants));
+    when(graph.relations()).thenReturn(List.of(edgeOf(source, sink)));
+    JsonNode entries =
+        OpenLineageClientUtils.newObjectMapper()
+            .valueToTree(converter.convert(graph, EventType.START).getJob().getFacets())
+            .path("lineage")
+            .path("entries");
+    assertThat(entries)
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"X\",\"inputs\":[{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"A\"}]},"
+                        + "{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"constants\",\"inputs\":[]}]"));
   }
 
   @Test

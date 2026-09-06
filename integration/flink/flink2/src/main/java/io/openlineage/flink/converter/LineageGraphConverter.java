@@ -11,6 +11,7 @@ import io.openlineage.client.OpenLineage.RunEvent.EventType;
 import io.openlineage.flink.api.OpenLineageContext;
 import io.openlineage.flink.client.Versions;
 import io.openlineage.flink.facets.FlinkJobDetailsFacet;
+import io.openlineage.flink.facets.FlinkLineageFacet;
 import io.openlineage.flink.visitor.Flink2VisitorFactory;
 import java.time.ZonedDateTime;
 import java.util.Collections;
@@ -52,6 +53,7 @@ public class LineageGraphConverter {
                                 .openlineageAdapterVersion(Versions.getVersion())
                                 .build())
                         .put("flink_job", buildJobDetailsFacet())
+                        .put("flink_lineage", FlinkLineageFacet.fromGraph(graph))
                         .build())
                 .build())
         .inputs(datasetExtractor.extractInputs(graph))

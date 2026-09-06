@@ -18,6 +18,7 @@ import java.util.Objects;
 import java.util.Optional;
 import org.apache.flink.api.connector.source.Boundedness;
 import org.apache.flink.streaming.api.lineage.LineageGraph;
+import org.apache.flink.streaming.api.lineage.LineageGraphObservation;
 import org.apache.flink.streaming.api.lineage.SourceLineageVertex;
 
 /** Class used to build job section of the OpenLineage events. */
@@ -49,7 +50,10 @@ class OpenLineageJobExtractor {
       jobTypeJobFacetBuilder.processingType(extractProcessingType(graph));
     }
     facetsBuilder.jobType(jobTypeJobFacetBuilder.build());
-    datasetExtractor.extractTableLineage(graph).ifPresent(facetsBuilder::lineage);
+    if (!(graph instanceof LineageGraphObservation)
+        || "COMPLETE".equals(((LineageGraphObservation) graph).getTableStatus())) {
+      datasetExtractor.extractTableLineage(graph).ifPresent(facetsBuilder::lineage);
+    }
     buildOwnershipFacet(facetsBuilder);
 
     return context

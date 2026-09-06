@@ -34,6 +34,7 @@ import org.apache.flink.streaming.api.lineage.ColumnLineageRelation;
 import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.streaming.api.lineage.LineageEdge;
 import org.apache.flink.streaming.api.lineage.LineageGraph;
+import org.apache.flink.streaming.api.lineage.LineageVertex;
 
 /** Class used to extract datasets from Flink lineage graph. */
 class OpenLineageDatasetExtractor {
@@ -50,13 +51,27 @@ class OpenLineageDatasetExtractor {
   }
 
   Optional<OpenLineage.LineageJobFacet> extractTableLineage(LineageGraph graph) {
-    if (graph == null || graph.relations() == null || graph.relations().isEmpty()) {
+    if (graph == null || graph.relations() == null) {
       // A missing graph is not evidence that every input feeds every output.
       return Optional.empty();
     }
     OpenLineage ol = context.getOpenLineage();
     Map<List<String>, Map<List<String>, OpenLineage.LineageInput>> inputsByOutput =
         new LinkedHashMap<>();
+    for (LineageVertex vertex : graph.sinks()) {
+      for (LineageDataset sink : vertex.datasets()) {
+        Collection<LineageDatasetWithIdentifier> outputs = extractDatasetsWithIdentifiers(sink);
+        if (outputs.isEmpty()) {
+          throw new IllegalStateException(
+              "No OpenLineage identifier for lineage sink " + sink.name());
+        }
+        for (LineageDatasetWithIdentifier output : outputs) {
+          DatasetIdentifier target = output.getDatasetIdentifier();
+          inputsByOutput.putIfAbsent(
+              List.of(target.getNamespace(), target.getName()), new LinkedHashMap<>());
+        }
+      }
+    }
     for (LineageEdge edge : graph.relations()) {
       for (LineageDataset sink : edge.sink().datasets()) {
         Collection<LineageDatasetWithIdentifier> outputs = extractDatasetsWithIdentifiers(sink);
@@ -101,7 +116,9 @@ class OpenLineageDatasetExtractor {
                     .name(id.get(1))
                     .inputs(new ArrayList<>(inputs.values()))
                     .build()));
-    return Optional.of(ol.newLineageJobFacetBuilder().entries(entries).build());
+    return entries.isEmpty()
+        ? Optional.empty()
+        : Optional.of(ol.newLineageJobFacetBuilder().entries(entries).build());
   }
 
   List<InputDataset> extractInputs(LineageGraph graph) {
@@ -214,7 +231,8 @@ class OpenLineageDatasetExtractor {
   }
 
   private List<InputField> inputFields(ColumnLineageRelation relation) {
-    List<InputField> inputFields = new ArrayList<>();
+    Map<List<String>, Map<String, InputFieldTransformations>> transformationsByField =
+        new LinkedHashMap<>();
     for (ColumnLineageInput input : relation.inputs()) {
       Collection<LineageDatasetWithIdentifier> datasets =
           extractDatasetsWithIdentifiers(input.inputDataset());
@@ -230,28 +248,34 @@ class OpenLineageDatasetExtractor {
                 input.inputDataset().name(),
                 input.inputField()));
       }
-      datasets.forEach(dataset -> inputFields.add(inputField(dataset, input)));
+      for (LineageDatasetWithIdentifier dataset : datasets) {
+        DatasetIdentifier id = dataset.getDatasetIdentifier();
+        String type = input.dependencyType().name();
+        transformationsByField
+            .computeIfAbsent(
+                List.of(id.getNamespace(), id.getName(), input.inputField()),
+                ignored -> new LinkedHashMap<>())
+            .putIfAbsent(type, new InputFieldTransformationsBuilder().type(type).build());
+      }
     }
+    List<InputField> inputFields = new ArrayList<>();
+    transformationsByField.forEach(
+        (id, transformations) ->
+            inputFields.add(
+                context
+                    .getOpenLineage()
+                    .newInputFieldBuilder()
+                    .namespace(id.get(0))
+                    .name(id.get(1))
+                    .field(id.get(2))
+                    .transformations(new ArrayList<>(transformations.values()))
+                    .build()));
     return inputFields;
   }
 
   private boolean sameDataset(LineageDataset first, LineageDataset second) {
     return Objects.equals(first.namespace(), second.namespace())
         && Objects.equals(first.name(), second.name());
-  }
-
-  private InputField inputField(LineageDatasetWithIdentifier dataset, ColumnLineageInput input) {
-    InputFieldTransformationsBuilder transformationBuilder =
-        new InputFieldTransformationsBuilder().type(input.dependencyType().name());
-    InputFieldTransformations transformation = transformationBuilder.build();
-    return context
-        .getOpenLineage()
-        .newInputFieldBuilder()
-        .namespace(dataset.getDatasetIdentifier().getNamespace())
-        .name(dataset.getDatasetIdentifier().getName())
-        .field(input.inputField())
-        .transformations(Collections.singletonList(transformation))
-        .build();
   }
 
   private Collection<LineageDatasetWithIdentifier> extractDatasetsWithIdentifiers(

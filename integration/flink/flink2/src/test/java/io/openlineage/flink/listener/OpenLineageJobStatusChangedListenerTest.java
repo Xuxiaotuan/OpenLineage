@@ -6,8 +6,10 @@
 package io.openlineage.flink.listener;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -18,6 +20,10 @@ import io.openlineage.client.OpenLineage.RunEvent.EventType;
 import io.openlineage.client.OpenLineageClientUtils;
 import io.openlineage.client.circuitBreaker.CircuitBreaker;
 import io.openlineage.flink.api.OpenLineageContext;
+import io.openlineage.flink.api.OpenLineageContextFactory;
+import io.openlineage.flink.client.EventEmitter;
+import io.openlineage.flink.config.FlinkConfigParser;
+import io.openlineage.flink.config.FlinkOpenLineageConfig;
 import io.openlineage.flink.visitor.Flink2VisitorFactory;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -33,12 +39,99 @@ import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.execution.DefaultJobExecutionStatusEvent;
 import org.apache.flink.core.execution.JobStatusChangedListenerFactory.Context;
+import org.apache.flink.streaming.api.lineage.LineageGraph;
+import org.apache.flink.streaming.api.lineage.LineageGraphObservation;
 import org.apache.flink.streaming.runtime.execution.JobCreatedEvent;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 class OpenLineageJobStatusChangedListenerTest {
+  @Test
+  @SneakyThrows
+  void conversionFailurePublishesUnavailableStatusForWholeLifecycle() {
+    listener = new OpenLineageJobStatusChangedListener(context, factory);
+    LineageGraph invalidGraph = mock(LineageGraph.class);
+    when(invalidGraph.sources())
+        .thenThrow(new IllegalArgumentException("invalid dataset identity"));
+    JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobName()).thenReturn("conversion-failed-job");
+    when(createdEvent.lineageGraph())
+        .thenReturn(new LineageGraphObservation(invalidGraph, "COMPLETE", "COMPLETE", List.of()));
+    listener.onEvent(createdEvent);
+    listener.onEvent(
+        new DefaultJobExecutionStatusEvent(
+            new JobID(1, 2), "conversion-failed-job", JobStatus.RUNNING, JobStatus.FINISHED, null));
+    List<RunEvent> events =
+        Files.readAllLines(Path.of(eventFileLocation)).stream()
+            .map(OpenLineageClientUtils::runEventFromJson)
+            .collect(Collectors.toList());
+    assertThat(events)
+        .extracting(RunEvent::getEventType)
+        .containsExactly(EventType.START, EventType.COMPLETE);
+    assertThat(events.get(0).getInputs()).isEmpty();
+    assertThat(events.get(0).getOutputs()).isEmpty();
+    assertThat(
+            OpenLineageClientUtils.newObjectMapper()
+                .valueToTree(events.get(0))
+                .path("job")
+                .path("facets")
+                .has("lineage"))
+        .isFalse();
+    assertThat(events.get(0).getRun().getRunId()).isEqualTo(events.get(1).getRun().getRunId());
+    for (RunEvent event : events) {
+      com.fasterxml.jackson.databind.JsonNode status =
+          OpenLineageClientUtils.newObjectMapper()
+              .valueToTree(event)
+              .path("run")
+              .path("facets")
+              .path("flink_lineage");
+      assertThat(status.path("tableStatus").asText()).isEqualTo("UNAVAILABLE");
+      assertThat(status.path("columnStatus").asText()).isEqualTo("UNAVAILABLE");
+      assertThat(status.path("issues").toString()).contains("invalid dataset identity");
+    }
+  }
+
+  @Test
+  void transportFailureDoesNotRetryOrEscapeListener() {
+    EventEmitter emitter = mock(EventEmitter.class);
+    doThrow(new IllegalStateException("transport unavailable"))
+        .when(emitter)
+        .emit(any(RunEvent.class));
+    FlinkOpenLineageConfig config = FlinkConfigParser.parse(context.getConfiguration());
+    config.setDisableCheckpointTracking(true);
+    OpenLineageContext lineageContext =
+        OpenLineageContextFactory.fromConfig(config).eventEmitter(emitter).build();
+    listener = new OpenLineageJobStatusChangedListener(lineageContext, factory);
+    JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobName()).thenReturn("transport-failed-job");
+    assertThatCode(() -> listener.onEvent(createdEvent)).doesNotThrowAnyException();
+    verify(emitter, times(1)).emit(any(RunEvent.class));
+  }
+
+  @Test
+  @SneakyThrows
+  void missingLineagePublishesUnavailableStatusAndLifecycle() {
+    listener = new OpenLineageJobStatusChangedListener(context, factory);
+    JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobName()).thenReturn("lineage-failed-job");
+    listener.onEvent(createdEvent);
+    listener.onEvent(
+        new DefaultJobExecutionStatusEvent(
+            new JobID(1, 2), "lineage-failed-job", JobStatus.RUNNING, JobStatus.FINISHED, null));
+    List<RunEvent> events =
+        Files.readAllLines(Path.of(eventFileLocation)).stream()
+            .map(OpenLineageClientUtils::runEventFromJson)
+            .collect(Collectors.toList());
+    assertThat(events).hasSize(2);
+    assertThat(events)
+        .extracting(RunEvent::getEventType)
+        .containsExactly(EventType.START, EventType.COMPLETE);
+    for (RunEvent event : events) {
+      assertThat(OpenLineageClientUtils.toJson(event)).contains("\"columnStatus\":\"UNAVAILABLE\"");
+    }
+  }
+
   Context context = mock(Context.class, RETURNS_DEEP_STUBS);
   Flink2VisitorFactory factory = mock(Flink2VisitorFactory.class);
   OpenLineageJobStatusChangedListener listener;
@@ -74,6 +167,8 @@ class OpenLineageJobStatusChangedListenerTest {
     listener = new OpenLineageJobStatusChangedListener(context, factory);
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
     when(createdEvent.jobName()).thenReturn("event-job-name");
+    when(createdEvent.lineageGraph())
+        .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
     listener.onEvent(createdEvent);
 
     Path path = Path.of(eventFileLocation);
@@ -109,6 +204,8 @@ class OpenLineageJobStatusChangedListenerTest {
     listener = new OpenLineageJobStatusChangedListener(context, factory);
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
     when(createdEvent.jobName()).thenReturn("event-job-name");
+    when(createdEvent.lineageGraph())
+        .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
     listener.onEvent(createdEvent);
 
     Path path = Path.of(eventFileLocation);
@@ -144,6 +241,8 @@ class OpenLineageJobStatusChangedListenerTest {
     listener = new OpenLineageJobStatusChangedListener(context, factory);
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
     when(createdEvent.jobName()).thenReturn("event-job-name");
+    when(createdEvent.lineageGraph())
+        .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
     listener.onEvent(createdEvent);
 
     Path path = Path.of(eventFileLocation);
@@ -169,6 +268,8 @@ class OpenLineageJobStatusChangedListenerTest {
     // emit start event
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
     when(createdEvent.jobName()).thenReturn("event-job-name");
+    when(createdEvent.lineageGraph())
+        .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
     listener.onEvent(createdEvent);
 
     // emit complete event
@@ -208,6 +309,8 @@ class OpenLineageJobStatusChangedListenerTest {
     // emit start event
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
     when(createdEvent.jobName()).thenReturn("event-job-name");
+    when(createdEvent.lineageGraph())
+        .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
     listener.onEvent(createdEvent);
 
     // emit fail event
@@ -234,6 +337,8 @@ class OpenLineageJobStatusChangedListenerTest {
     // emit start event
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
     when(createdEvent.jobName()).thenReturn("event-job-name");
+    when(createdEvent.lineageGraph())
+        .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
     listener.onEvent(createdEvent);
 
     // emit abort event

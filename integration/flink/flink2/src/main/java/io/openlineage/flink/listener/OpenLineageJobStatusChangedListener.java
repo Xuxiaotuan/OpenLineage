@@ -19,11 +19,14 @@ import io.openlineage.flink.config.FlinkConfigParser;
 import io.openlineage.flink.config.FlinkOpenLineageConfig;
 import io.openlineage.flink.converter.LineageGraphConverter;
 import io.openlineage.flink.facets.FlinkJobDetailsFacet;
+import io.openlineage.flink.facets.FlinkLineageFacet;
 import io.openlineage.flink.tracker.OpenLineageContinousJobTracker;
 import io.openlineage.flink.util.JobStatusUtil;
 import io.openlineage.flink.visitor.Flink2VisitorFactory;
 import java.time.Duration;
 import java.time.ZonedDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import lombok.extern.slf4j.Slf4j;
@@ -43,6 +46,7 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
   private final OpenLineageContext context;
   private final LineageGraphConverter graphConverter;
   private OpenLineageContinousJobTracker tracker;
+  private FlinkLineageFacet lineageStatus;
 
   public OpenLineageJobStatusChangedListener(Context context, Flink2VisitorFactory visitorFactory) {
     this.context =
@@ -92,11 +96,41 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
   }
 
   private void onJobCreatedEvent(JobCreatedEvent event) {
+    lineageStatus = FlinkLineageFacet.fromGraph(event.lineageGraph());
     loadJobId(event);
+    RunEvent startEvent;
     try {
-      context.getEventEmitter().emit(graphConverter.convert(event.lineageGraph(), EventType.START));
+      startEvent = graphConverter.convert(event.lineageGraph(), EventType.START);
     } catch (Exception e) {
-      log.error("Triggering event caused an exception", e);
+      log.error("Converting lineage failed; emitting unavailable observation", e);
+      List<String> issues = new ArrayList<>(lineageStatus.getIssues());
+      issues.add(
+          "OpenLineage conversion failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+      lineageStatus = new FlinkLineageFacet("UNAVAILABLE", "UNAVAILABLE", issues);
+      OpenLineage openLineage = context.getOpenLineage();
+      startEvent =
+          commonEventBuilder()
+              .eventType(EventType.START)
+              .run(
+                  openLineage
+                      .newRunBuilder()
+                      .runId(context.getRunUuid())
+                      .facets(
+                          openLineage
+                              .newRunFacetsBuilder()
+                              .processing_engine(buildProcessingEngineFacet(openLineage))
+                              .put(FLINK_JOB_FACET_KEY, buildJobDetailsFacet())
+                              .put("flink_lineage", lineageStatus)
+                              .build())
+                      .build())
+              .inputs(Collections.emptyList())
+              .outputs(Collections.emptyList())
+              .build();
+    }
+    try {
+      context.getEventEmitter().emit(startEvent);
+    } catch (Exception e) {
+      log.error("Emitting START event failed", e);
     }
     if (context.getConfig().getDisableCheckpointTracking()) {
       log.info("Checkpoint tracking is disabled via disableCheckpointTracking config");
@@ -121,6 +155,7 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
                             .processing_engine(buildProcessingEngineFacet(openLineage))
                             .put("checkpoints", checkpointFacet)
                             .put(FLINK_JOB_FACET_KEY, buildJobDetailsFacet())
+                            .put("flink_lineage", lineageStatus)
                             .build())
                     .build())
             .build();
@@ -133,10 +168,21 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
 
   private void onDefaultJobExecutionStatusEvent(DefaultJobExecutionStatusEvent event) {
     if (context.getJobId() == null) {
-      // If jobId wasn't recorded, then there was no START event emitted.
-      // This means that current event is CANCELLED, so we should not emit anything.
-      log.warn("JobId is not set, skipping event: {}", event);
-      return;
+      loadJobId(event);
+      java.util.Map<String, String> status = event.getLineageStatus();
+      String issues =
+          status.getOrDefault(
+              DefaultJobExecutionStatusEvent.LINEAGE_ISSUES,
+              "No lineage observation was transferred");
+      lineageStatus =
+          new FlinkLineageFacet(
+              status.getOrDefault(
+                  DefaultJobExecutionStatusEvent.LINEAGE_TABLE_STATUS, "UNAVAILABLE"),
+              status.getOrDefault(
+                  DefaultJobExecutionStatusEvent.LINEAGE_COLUMN_STATUS, "UNAVAILABLE"),
+              issues.isEmpty()
+                  ? java.util.Collections.emptyList()
+                  : java.util.Arrays.asList(issues.split("\n")));
     }
 
     OpenLineage openLineage = context.getOpenLineage();
@@ -152,6 +198,7 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
                             .newRunFacetsBuilder()
                             .processing_engine(buildProcessingEngineFacet(openLineage))
                             .put(FLINK_JOB_FACET_KEY, buildJobDetailsFacet())
+                            .put("flink_lineage", lineageStatus)
                             .build())
                     .build())
             .build();
@@ -195,7 +242,7 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
     return new FlinkJobDetailsFacet(flinkJobId);
   }
 
-  private void loadJobId(JobCreatedEvent createdEvent) {
+  private void loadJobId(JobStatusChangedEvent createdEvent) {
     String jobName =
         Optional.ofNullable(context.getConfig())
             .map(FlinkOpenLineageConfig::getJobConfig)
@@ -216,5 +263,8 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
             .build();
     log.info("JobIdentifier with jobId: {}", jobId.getFlinkJobId());
     context.setJobId(jobId);
+    if (createdEvent.jobId() != null) {
+      context.setRunUuidFromFlinkJobId(createdEvent.jobId(), java.time.Instant.EPOCH);
+    }
   }
 }

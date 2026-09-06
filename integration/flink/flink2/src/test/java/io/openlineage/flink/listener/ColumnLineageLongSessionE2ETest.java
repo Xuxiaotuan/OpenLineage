@@ -7,7 +7,6 @@ package io.openlineage.flink.listener;
 
 import static org.apache.flink.configuration.DeploymentOptions.JOB_STATUS_CHANGED_LISTENERS;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -161,17 +160,35 @@ public class ColumnLineageLongSessionE2ETest {
   }
 
   @Test
-  void incompleteLongSessionPlanCannotCreateJob(@InjectMiniCluster MiniCluster cluster)
+  void incompleteLongSessionPlanStillExecutes(@InjectMiniCluster MiniCluster cluster)
       throws Exception {
     TableEnvironment environment = environment(true);
     JsonNode plan = MAPPER.readTree(loadSession(environment).compilePlan().asJsonString());
     assertThat(removeLineage(plan)).isEqualTo(2);
-    int jobsBefore = cluster.listJobs().get().size();
-    assertThatThrownBy(
-            () -> environment.loadPlan(PlanReference.fromJsonString(plan.toString())).execute())
-        .hasStackTraceContaining("compiled plan does not contain complete column lineage");
-    assertThat(cluster.listJobs().get()).hasSize(jobsBefore);
-    assertThat(Files.exists(EVENTS)).isFalse();
+    environment
+        .loadPlan(PlanReference.fromJsonString(plan.toString()))
+        .execute()
+        .await(30, TimeUnit.SECONDS);
+    assertThat(TestValuesTableFactory.getResults("OrderDetail"))
+        .containsExactlyInAnyOrder(
+            Row.of(1L, "gold", 105L), Row.of(4L, "silver", 305L), Row.of(6L, "gold", 55L));
+    assertThat(TestValuesTableFactory.getResults("TierSummary"))
+        .containsExactlyInAnyOrder(Row.of("gold", 160L, 2L), Row.of("silver", 305L, 1L));
+    List<RunEvent> events = LineageTestUtils.fromFile(EVENTS.toString());
+    assertThat(events)
+        .extracting(RunEvent::getEventType)
+        .contains(EventType.START, EventType.COMPLETE);
+    for (RunEvent event : events) {
+      JsonNode status = MAPPER.valueToTree(event).path("run").path("facets").path("flink_lineage");
+      assertThat(status.path("columnStatus").asText()).isEqualTo("UNAVAILABLE");
+      assertThat(status.path("issues").size()).isGreaterThan(0);
+      if (event.getEventType() == EventType.START) {
+        assertThat(event.getOutputs()).hasSize(2);
+        assertThat(event.getOutputs())
+            .allSatisfy(output -> assertThat(output.getFacets().getColumnLineage()).isNull());
+        assertThat(event.getJob().getFacets().getLineage()).isNull();
+      }
+    }
   }
 
   private static StatementSet loadSession(TableEnvironment environment) throws Exception {
@@ -224,13 +241,15 @@ public class ColumnLineageLongSessionE2ETest {
       String name = input.path("name").asText();
       assertThat(name).isIn(identity("RawOrders"), identity("Customers"));
       String table = name.equals(identity("RawOrders")) ? "RawOrders" : "Customers";
-      assertThat(input.path("transformations").size()).isEqualTo(1);
-      actual.add(
-          table
-              + "."
-              + input.path("field").asText()
-              + ":"
-              + input.path("transformations").get(0).path("type").asText());
+      assertThat(input.path("transformations").size()).isGreaterThan(0);
+      for (JsonNode transformation : input.path("transformations")) {
+        actual.add(
+            table
+                + "."
+                + input.path("field").asText()
+                + ":"
+                + transformation.path("type").asText());
+      }
     }
     List<String> expected = new ArrayList<>(Arrays.asList(indirect));
     expected.addAll(Arrays.asList(direct));

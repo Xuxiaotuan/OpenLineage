@@ -7,7 +7,6 @@ package io.openlineage.flink.listener;
 
 import static org.apache.flink.configuration.DeploymentOptions.JOB_STATUS_CHANGED_LISTENERS;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -103,15 +102,13 @@ class ColumnLineageStatementSetE2ETest {
                     + "\"name\":\"`default_catalog`.`default_database`.`RevenueSink`\","
                     + "\"columnLineage\":{\"fields\":{"
                     + "\"region\":{\"transformationDescription\":\"GROUP_BY,JOIN,FILTER\",\"inputFields\":["
-                    + input("Orders", "region", "DIRECT")
+                    + input("Orders", "region", "DIRECT", "INDIRECT")
                     + ","
                     + input("Orders", "customer_id", "INDIRECT")
                     + ","
                     + input("Customers", "customer_id", "INDIRECT")
                     + ","
                     + input("Customers", "tier", "INDIRECT")
-                    + ","
-                    + input("Orders", "region", "INDIRECT")
                     + "]},"
                     + "\"revenue\":{\"transformationDescription\":\"EXPRESSION,AGGREGATION,JOIN,FILTER,GROUP_BY\",\"inputFields\":["
                     + input("Orders", "amount", "DIRECT")
@@ -128,13 +125,11 @@ class ColumnLineageStatementSetE2ETest {
                     + "\"name\":\"`default_catalog`.`default_database`.`TierSink`\","
                     + "\"columnLineage\":{\"fields\":{"
                     + "\"tier\":{\"transformationDescription\":\"GROUP_BY,JOIN\",\"inputFields\":["
-                    + input("Customers", "tier", "DIRECT")
+                    + input("Customers", "tier", "DIRECT", "INDIRECT")
                     + ","
                     + input("Orders", "customer_id", "INDIRECT")
                     + ","
                     + input("Customers", "customer_id", "INDIRECT")
-                    + ","
-                    + input("Customers", "tier", "INDIRECT")
                     + "]},"
                     + "\"order_count\":{\"transformationDescription\":\"AGGREGATION,JOIN,GROUP_BY\",\"inputFields\":["
                     + input("Orders", "order_id", "DIRECT")
@@ -241,7 +236,7 @@ class ColumnLineageStatementSetE2ETest {
   }
 
   @Test
-  void rejectsIncompleteLineageBeforeCreatingAJob(@InjectMiniCluster MiniCluster miniCluster)
+  void incompleteLineageDoesNotPreventJobExecution(@InjectMiniCluster MiniCluster miniCluster)
       throws Exception {
     TableEnvironmentImpl environment = createEnvironment();
     CompiledPlan compiledPlan = createStatementSet(environment).compilePlan();
@@ -256,13 +251,23 @@ class ColumnLineageStatementSetE2ETest {
     assertThat(miniCluster.listJobs().get()).hasSize(jobsBefore);
     assertThat(Files.exists(EVENTS_FILE)).isFalse();
 
-    assertThatThrownBy(legacyPlan::execute)
-        .hasStackTraceContaining("compiled plan does not contain complete column lineage")
-        .hasStackTraceContaining("RevenueSink")
-        .hasStackTraceContaining("field '<unknown>'");
-
-    assertThat(miniCluster.listJobs().get()).hasSize(jobsBefore);
-    assertThat(Files.exists(EVENTS_FILE)).isFalse();
+    legacyPlan.execute().await(30, TimeUnit.SECONDS);
+    assertThat(miniCluster.listJobs().get()).hasSize(jobsBefore + 1);
+    List<RunEvent> events = LineageTestUtils.fromFile(EVENTS_FILE.toString());
+    assertThat(events)
+        .extracting(RunEvent::getEventType)
+        .contains(EventType.START, EventType.COMPLETE);
+    for (RunEvent event : events) {
+      JsonNode status =
+          OBJECT_MAPPER.valueToTree(event).path("run").path("facets").path("flink_lineage");
+      assertThat(status.path("columnStatus").asText()).isEqualTo("UNAVAILABLE");
+      assertThat(status.path("issues").size()).isGreaterThan(0);
+      if (event.getEventType() == EventType.START) {
+        assertThat(event.getOutputs()).hasSize(2);
+        assertThat(event.getOutputs())
+            .allSatisfy(output -> assertThat(output.getFacets().getColumnLineage()).isNull());
+      }
+    }
   }
 
   @Test
@@ -337,12 +342,7 @@ class ColumnLineageStatementSetE2ETest {
       JsonNode fields = OBJECT_MAPPER.valueToTree(output.getFacets().getColumnLineage());
       assertThat(fields.path("fields").path("a").path("inputFields"))
           .isEqualTo(
-              OBJECT_MAPPER.readTree(
-                  "["
-                      + input(sources[i], "a", "DIRECT")
-                      + ","
-                      + input(sources[i], "a", "INDIRECT")
-                      + "]"));
+              OBJECT_MAPPER.readTree("[" + input(sources[i], "a", "DIRECT", "INDIRECT") + "]"));
     }
   }
 
@@ -432,14 +432,14 @@ class ColumnLineageStatementSetE2ETest {
     return removed;
   }
 
-  private static String input(String table, String field, String dependencyType) {
+  private static String input(String table, String field, String... dependencyTypes) {
     return "{\"namespace\":\"values://FromElementsFunction\","
         + "\"name\":\"`default_catalog`.`default_database`.`"
         + table
         + "`\",\"field\":\""
         + field
         + "\",\"transformations\":[{\"type\":\""
-        + dependencyType
+        + String.join("\"},{\"type\":\"", dependencyTypes)
         + "\"}]}";
   }
 
