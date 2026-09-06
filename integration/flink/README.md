@@ -107,6 +107,18 @@ nodes. JSON_VALUE operates on a STRING payload; this does not establish support
 for nested ROW field access, arbitrary UDF internals, external UDF Jar loading,
 real Kafka/Paimon connectors, remote transport delivery or SQL Gateway deployment.
 
+### SQL Client distribution acceptance
+
+The opt-in [SQL Client acceptance script](flink2/src/test/scripts/sql-client-lineage/README.md)
+uses a real paired distribution, the adapter in `lib`, and filesystem/CSV tables.
+It retains exact data and field-lineage checks rather than trusting process exit status.
+All three checks passed with the paired Flink `BatchExecMultipleInput` persistence
+repair: direct execution, incomplete-lineage rejection, and complex batch restore
+in a fresh SQL Client process without original table/view definitions. The fixture
+requires a MultipleInput node; its small CSV inputs select NestedLoopJoin, not
+AdaptiveJoin. No optimizer setting is disabled to bypass serialization failures.
+Follow the linked build instructions to avoid stale classes in incremental shaded Jars.
+
 ----
 SPDX-License-Identifier: Apache-2.0\
 Copyright 2018-2026 contributors to the OpenLineage project
