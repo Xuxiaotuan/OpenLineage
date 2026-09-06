@@ -47,6 +47,7 @@ import org.apache.flink.streaming.api.lineage.ColumnLineageOrigin;
 import org.apache.flink.streaming.api.lineage.ColumnLineageRelation;
 import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.streaming.api.lineage.LineageDatasetFacet;
+import org.apache.flink.streaming.api.lineage.LineageEdge;
 import org.apache.flink.streaming.api.lineage.LineageGraph;
 import org.apache.flink.streaming.api.lineage.LineageVertex;
 import org.apache.flink.streaming.api.lineage.SourceLineageVertex;
@@ -503,6 +504,129 @@ class LineageGraphConverterTest {
                         + "\"transformations\":[{\"type\":\"INDIRECT\"}]},"
                         + "{\"namespace\":\"warehouse\",\"name\":\"orders\",\"field\":\"is_current\","
                         + "\"transformations\":[{\"type\":\"INDIRECT\"}]}]}}}}}]"));
+  }
+
+  @Test
+  void independentSinksKeepExactTablePairs() throws Exception {
+    LineageDataset a = lineageDatasetOf("A", "ns").getFlinkDataset();
+    LineageDataset b = lineageDatasetOf("B", "ns").getFlinkDataset();
+    LineageVertex x = vertexOf(lineageDatasetOf("X", "ns").getFlinkDataset());
+    LineageVertex y = vertexOf(lineageDatasetOf("Y", "ns").getFlinkDataset());
+    SourceLineageVertex av = sourceVertexOf(Boundedness.BOUNDED, List.of(a));
+    SourceLineageVertex bv = sourceVertexOf(Boundedness.BOUNDED, List.of(b));
+    when(graph.sources()).thenReturn(List.of(av, bv));
+    when(graph.sinks()).thenReturn(List.of(x, y));
+    when(graph.relations()).thenReturn(List.of(edgeOf(av, x), edgeOf(bv, y), edgeOf(av, x)));
+    JsonNode json =
+        OpenLineageClientUtils.newObjectMapper()
+            .readTree(
+                OpenLineageClientUtils.newObjectMapper()
+                    .writeValueAsString(converter.convert(graph, EventType.START)));
+    assertThat(json.path("job").path("facets").path("lineage").path("entries"))
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"X\",\"inputs\":[{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"A\"}]},"
+                        + "{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"Y\",\"inputs\":[{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"B\"}]}]"));
+  }
+
+  @Test
+  void sameFieldKeepsDirectAndIndirectRolesInSerializedEvent() throws Exception {
+    LineageDataset source = lineageDatasetOf("T", "ns").getFlinkDataset();
+    LineageDataset sink = lineageDatasetOf("S", "ns").getFlinkDataset();
+    when(graph.sources()).thenReturn(List.of(sourceVertexOf(Boundedness.BOUNDED, List.of(source))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(sink)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    sink,
+                    "a",
+                    List.of(
+                        inputOf(source, "a", ColumnLineageDependencyType.DIRECT),
+                        inputOf(source, "a", ColumnLineageDependencyType.INDIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    "FILTER")));
+    assertThat(
+            outputsJson()
+                .get(0)
+                .path("facets")
+                .path("columnLineage")
+                .path("fields")
+                .path("a")
+                .path("inputFields"))
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"namespace\":\"ns\",\"name\":\"T\",\"field\":\"a\",\"transformations\":[{\"type\":\"DIRECT\"}]},"
+                        + "{\"namespace\":\"ns\",\"name\":\"T\",\"field\":\"a\",\"transformations\":[{\"type\":\"INDIRECT\"}]}]"));
+  }
+
+  @Test
+  void tablePairsUseResolvedDatasetIdentifiersAndMergeInputs() throws Exception {
+    LineageDataset source = lineageDatasetOf("logical", "catalog").getFlinkDataset();
+    LineageDataset sink = lineageDatasetOf("sink", "catalog").getFlinkDataset();
+    when(visitorFactory.loadDatasetIdentifierVisitors(context))
+        .thenReturn(
+            List.of(
+                new MultipleDatasetIdentifierVisitor(
+                    source,
+                    List.of(
+                        new DatasetIdentifier("orders", "physical-one"),
+                        new DatasetIdentifier("orders", "physical-two"))),
+                new MultipleDatasetIdentifierVisitor(
+                    sink, List.of(new DatasetIdentifier("result", "warehouse")))));
+    converter = new LineageGraphConverter(context, visitorFactory);
+    SourceLineageVertex av = sourceVertexOf(Boundedness.BOUNDED, List.of(source));
+    SourceLineageVertex bv =
+        sourceVertexOf(
+            Boundedness.BOUNDED, List.of(lineageDatasetOf("other", "catalog").getFlinkDataset()));
+    LineageVertex sv = vertexOf(sink);
+    when(graph.sources()).thenReturn(List.of(av, bv));
+    when(graph.sinks()).thenReturn(List.of(sv));
+    when(graph.relations()).thenReturn(List.of(edgeOf(av, sv), edgeOf(bv, sv)));
+    JsonNode entries =
+        OpenLineageClientUtils.newObjectMapper()
+            .valueToTree(converter.convert(graph, EventType.START).getJob().getFacets())
+            .path("lineage")
+            .path("entries");
+    assertThat(entries)
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"type\":\"DATASET\",\"namespace\":\"warehouse\",\"name\":\"result\",\"inputs\":["
+                        + "{\"type\":\"DATASET\",\"namespace\":\"physical-one\",\"name\":\"orders\"},"
+                        + "{\"type\":\"DATASET\",\"namespace\":\"physical-two\",\"name\":\"orders\"},"
+                        + "{\"type\":\"DATASET\",\"namespace\":\"catalog\",\"name\":\"other\"}]}]"));
+  }
+
+  @Test
+  void rejectsUnresolvableTableEdgeRatherThanDroppingIt() {
+    LineageDataset source = lineageDatasetOf("unresolved", "ns").getFlinkDataset();
+    LineageDataset sink = lineageDatasetOf("sink", "ns").getFlinkDataset();
+    when(visitorFactory.loadDatasetIdentifierVisitors(context))
+        .thenReturn(List.of(new EmptyDatasetIdentifierVisitor(source)));
+    converter = new LineageGraphConverter(context, visitorFactory);
+    when(graph.relations())
+        .thenReturn(
+            List.of(edgeOf(sourceVertexOf(Boundedness.BOUNDED, List.of(source)), vertexOf(sink))));
+    assertThatThrownBy(() -> converter.convert(graph, EventType.START))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("unresolved");
+  }
+
+  private LineageEdge edgeOf(SourceLineageVertex source, LineageVertex sink) {
+    return new LineageEdge() {
+      @Override
+      public SourceLineageVertex source() {
+        return source;
+      }
+
+      @Override
+      public LineageVertex sink() {
+        return sink;
+      }
+    };
   }
 
   private JsonNode outputsJson() throws Exception {

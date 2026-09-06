@@ -26,8 +26,8 @@ public class LineageGraphConverter {
 
   public LineageGraphConverter(OpenLineageContext context, Flink2VisitorFactory visitorFactory) {
     this.context = context;
-    this.jobExtractor = new OpenLineageJobExtractor(context);
     this.datasetExtractor = new OpenLineageDatasetExtractor(context, visitorFactory);
+    this.jobExtractor = new OpenLineageJobExtractor(context, datasetExtractor);
   }
 
   public RunEvent convert(LineageGraph graph, EventType eventType) {

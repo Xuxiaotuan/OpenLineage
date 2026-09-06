@@ -28,9 +28,12 @@ class OpenLineageJobExtractor {
   public static final String STREAMING = "STREAMING";
 
   private final OpenLineageContext context;
+  private final OpenLineageDatasetExtractor datasetExtractor;
 
-  OpenLineageJobExtractor(OpenLineageContext context) {
+  OpenLineageJobExtractor(
+      OpenLineageContext context, OpenLineageDatasetExtractor datasetExtractor) {
     this.context = context;
+    this.datasetExtractor = datasetExtractor;
   }
 
   OpenLineage.Job extract(LineageGraph graph) {
@@ -46,6 +49,7 @@ class OpenLineageJobExtractor {
       jobTypeJobFacetBuilder.processingType(extractProcessingType(graph));
     }
     facetsBuilder.jobType(jobTypeJobFacetBuilder.build());
+    datasetExtractor.extractTableLineage(graph).ifPresent(facetsBuilder::lineage);
     buildOwnershipFacet(facetsBuilder);
 
     return context

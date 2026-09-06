@@ -23,13 +23,16 @@ import io.openlineage.flink.visitor.identifier.DatasetIdentifierVisitor;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.flink.streaming.api.lineage.ColumnLineageInput;
 import org.apache.flink.streaming.api.lineage.ColumnLineageRelation;
 import org.apache.flink.streaming.api.lineage.LineageDataset;
+import org.apache.flink.streaming.api.lineage.LineageEdge;
 import org.apache.flink.streaming.api.lineage.LineageGraph;
 
 /** Class used to extract datasets from Flink lineage graph. */
@@ -44,6 +47,61 @@ class OpenLineageDatasetExtractor {
     this.facetVisitors = visitorFactory.loadDatasetFacetVisitors(context);
     this.identifierVisitors = visitorFactory.loadDatasetIdentifierVisitors(context);
     this.namespaceResolver = new DatasetNamespaceCombinedResolver(context.getConfig());
+  }
+
+  Optional<OpenLineage.LineageJobFacet> extractTableLineage(LineageGraph graph) {
+    if (graph == null || graph.relations() == null || graph.relations().isEmpty()) {
+      // A missing graph is not evidence that every input feeds every output.
+      return Optional.empty();
+    }
+    OpenLineage ol = context.getOpenLineage();
+    Map<List<String>, Map<List<String>, OpenLineage.LineageInput>> inputsByOutput =
+        new LinkedHashMap<>();
+    for (LineageEdge edge : graph.relations()) {
+      for (LineageDataset sink : edge.sink().datasets()) {
+        Collection<LineageDatasetWithIdentifier> outputs = extractDatasetsWithIdentifiers(sink);
+        if (outputs.isEmpty()) {
+          throw new IllegalStateException(
+              "No OpenLineage identifier for lineage sink " + sink.name());
+        }
+        for (LineageDatasetWithIdentifier output : outputs) {
+          DatasetIdentifier target = output.getDatasetIdentifier();
+          Map<List<String>, OpenLineage.LineageInput> inputs =
+              inputsByOutput.computeIfAbsent(
+                  List.of(target.getNamespace(), target.getName()),
+                  ignored -> new LinkedHashMap<>());
+          for (LineageDataset source : edge.source().datasets()) {
+            Collection<LineageDatasetWithIdentifier> sources =
+                extractDatasetsWithIdentifiers(source);
+            if (sources.isEmpty()) {
+              throw new IllegalStateException(
+                  "No OpenLineage identifier for lineage source " + source.name());
+            }
+            for (LineageDatasetWithIdentifier input : sources) {
+              DatasetIdentifier id = input.getDatasetIdentifier();
+              inputs.putIfAbsent(
+                  List.of(id.getNamespace(), id.getName()),
+                  ol.newLineageDatasetInputBuilder()
+                      .type(OpenLineage.LineageDatasetInput.Type.DATASET)
+                      .namespace(id.getNamespace())
+                      .name(id.getName())
+                      .build());
+            }
+          }
+        }
+      }
+    }
+    List<OpenLineage.LineageEntry> entries = new ArrayList<>();
+    inputsByOutput.forEach(
+        (id, inputs) ->
+            entries.add(
+                ol.newLineageDatasetEntryBuilder()
+                    .type(OpenLineage.LineageDatasetEntry.Type.DATASET)
+                    .namespace(id.get(0))
+                    .name(id.get(1))
+                    .inputs(new ArrayList<>(inputs.values()))
+                    .build()));
+    return Optional.of(ol.newLineageJobFacetBuilder().entries(entries).build());
   }
 
   List<InputDataset> extractInputs(LineageGraph graph) {

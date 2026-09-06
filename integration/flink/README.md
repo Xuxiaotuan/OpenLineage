@@ -31,6 +31,28 @@ Flink rejects incomplete lineage before submission. Successful submission does
 not guarantee transport delivery: the existing listener reports transport
 failures without rolling back the submitted job.
 
+### Exact table pairs in emitted events
+
+The Flink 2 converter also emits `job.facets.lineage.entries` from
+`LineageGraph.relations()`. Each output dataset lists only its actual logical
+input datasets: independent StatementSet branches `A -> X` and `B -> Y` do not
+become `A -> Y` or `B -> X`. Repeated edges are deduplicated, and edges into the
+same output are merged by namespace and name. Dataset identifier visitors and
+namespace resolution are shared with the event's input/output datasets.
+
+The existing top-level `inputs` and `outputs` remain available for compatibility.
+Consumers must read the lineage facet to preserve precise table pairs; support
+in Marquez storage, APIs and UI has **not** been verified. An absent/empty graph
+does not manufacture a complete bipartite mapping. An edge whose dataset visitor
+produces no identifier fails conversion instead of silently dropping that edge;
+the listener's existing transport/conversion error policy is unchanged.
+
+Regression tests check independent branches with real sink rows for direct and
+compiled-plan execution in MiniCluster, and verify that the same input field's
+DIRECT and INDIRECT roles both survive event serialization. These tests use
+Values and file transport, not Marquez or production connectors. This change
+does not add exact expression provenance, origin propagation or reliable delivery.
+
 If optimization removes a source entirely (for example, `WHERE 1=0`), Flink
 retains its logical table and column dependencies using a frozen source snapshot.
 The source is not added back to the execution topology. These events describe

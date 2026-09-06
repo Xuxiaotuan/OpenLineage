@@ -265,6 +265,87 @@ class ColumnLineageStatementSetE2ETest {
     assertThat(Files.exists(EVENTS_FILE)).isFalse();
   }
 
+  @Test
+  void independentTablePairsSurviveDirectSubmission() throws Exception {
+    assertIndependentTablePairs(false);
+  }
+
+  @Test
+  void independentTablePairsSurvivePlanRestore() throws Exception {
+    assertIndependentTablePairs(true);
+  }
+
+  private void assertIndependentTablePairs(boolean restore) throws Exception {
+    TableEnvironmentImpl environment = createEnvironment();
+    Schema schema = Schema.newBuilder().column("a", DataTypes.BIGINT()).build();
+    String[] sources = {"IndependentA", "IndependentB"};
+    String[] sinks = {"IndependentX", "IndependentY"};
+    StatementSet statements = environment.createStatementSet();
+    for (int i = 0; i < 2; i++) {
+      String data = TestValuesTableFactory.registerData(List.of(Row.of(11L + i)));
+      environment.createTemporaryTable(
+          sources[i],
+          TableDescriptor.forConnector("values")
+              .schema(schema)
+              .option("bounded", "true")
+              .option("data-id", data)
+              .build());
+      environment.createTemporaryTable(
+          sinks[i], TableDescriptor.forConnector("values").schema(schema).build());
+      statements.addInsertSql(
+          "INSERT INTO " + sinks[i] + " SELECT a FROM " + sources[i] + " WHERE a > 0");
+    }
+    if (restore) {
+      String plan = statements.compilePlan().asJsonString();
+      environment
+          .loadPlan(PlanReference.fromJsonString(plan))
+          .execute()
+          .await(30, TimeUnit.SECONDS);
+    } else {
+      statements.execute().await(30, TimeUnit.SECONDS);
+    }
+    assertThat(TestValuesTableFactory.getResults("IndependentX")).containsExactly(Row.of(11L));
+    assertThat(TestValuesTableFactory.getResults("IndependentY")).containsExactly(Row.of(12L));
+    RunEvent start =
+        LineageTestUtils.fromFile(EVENTS_FILE.toString()).stream()
+            .filter(e -> e.getEventType() == EventType.START)
+            .findFirst()
+            .orElseThrow();
+    JsonNode entries =
+        OBJECT_MAPPER.valueToTree(start.getJob().getFacets()).path("lineage").path("entries");
+    assertThat(entries.size()).isEqualTo(2);
+    for (int i = 0; i < 2; i++) {
+      String target = "`default_catalog`.`default_database`.`" + sinks[i] + "`";
+      JsonNode entry = null;
+      for (JsonNode candidate : entries) {
+        if (candidate.path("name").asText().equals(target)) {
+          entry = candidate;
+        }
+      }
+      assertThat(entry).isNotNull();
+      assertThat(entry.path("namespace").asText()).isEqualTo("values://AppendingSinkFunction");
+      assertThat(entry.path("inputs").size()).isEqualTo(1);
+      assertThat(entry.path("inputs").get(0).path("namespace").asText())
+          .isEqualTo("values://FromElementsFunction");
+      assertThat(entry.path("inputs").get(0).path("name").asText())
+          .isEqualTo("`default_catalog`.`default_database`.`" + sources[i] + "`");
+      OutputDataset output =
+          start.getOutputs().stream()
+              .filter(o -> o.getName().equals(target))
+              .findFirst()
+              .orElseThrow();
+      JsonNode fields = OBJECT_MAPPER.valueToTree(output.getFacets().getColumnLineage());
+      assertThat(fields.path("fields").path("a").path("inputFields"))
+          .isEqualTo(
+              OBJECT_MAPPER.readTree(
+                  "["
+                      + input(sources[i], "a", "DIRECT")
+                      + ","
+                      + input(sources[i], "a", "INDIRECT")
+                      + "]"));
+    }
+  }
+
   private static StatementSet createStatementSet(TableEnvironmentImpl environment) {
     StatementSet statementSet = environment.createStatementSet();
     statementSet.addInsertSql(REVENUE_INSERT);
