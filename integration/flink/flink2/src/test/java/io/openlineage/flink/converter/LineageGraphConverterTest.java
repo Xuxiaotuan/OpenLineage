@@ -98,6 +98,79 @@ class LineageGraphConverterTest {
   }
 
   @Test
+  void duplicateResolvedInventoriesRetainOneIdenticalDefinition() {
+    for (boolean outputs : new boolean[] {false, true}) {
+      configureDuplicateInventory(outputs, "BIGINT");
+      OpenLineage.RunEvent event = converter.convert(graph, EventType.START);
+      assertThat(outputs ? event.getOutputs() : event.getInputs()).hasSize(1);
+    }
+  }
+
+  @Test
+  void conflictingResolvedInventoryDefinitionsFailConversion() {
+    for (boolean outputs : new boolean[] {false, true}) {
+      configureDuplicateInventory(outputs, "STRING");
+      assertThatThrownBy(() -> converter.convert(graph, EventType.START))
+          .isInstanceOf(IllegalStateException.class)
+          .hasMessageContaining("Conflicting dataset definitions")
+          .hasMessageContaining("resolved")
+          .hasMessageContaining("shared");
+    }
+  }
+
+  private void configureDuplicateInventory(boolean outputs, String secondType) {
+    LineageDataset first = lineageDatasetOf("native-one", "native").getFlinkDataset();
+    LineageDataset second = lineageDatasetOf("native-two", "native").getFlinkDataset();
+    when(graph.sources())
+        .thenReturn(
+            outputs
+                ? List.of()
+                : List.of(
+                    sourceVertexOf(Boundedness.BOUNDED, List.of(first)),
+                    sourceVertexOf(Boundedness.BOUNDED, List.of(second))));
+    when(graph.sinks())
+        .thenReturn(outputs ? List.of(vertexOf(first), vertexOf(second)) : List.of());
+    when(visitorFactory.loadDatasetIdentifierVisitors(context))
+        .thenReturn(
+            List.of(
+                new MultipleDatasetIdentifierVisitor(
+                    first, List.of(new DatasetIdentifier("shared", "resolved"))),
+                new MultipleDatasetIdentifierVisitor(
+                    second, List.of(new DatasetIdentifier("shared", "resolved")))));
+    when(visitorFactory.loadDatasetFacetVisitors(context))
+        .thenReturn(
+            List.of(
+                new DatasetFacetVisitor() {
+                  @Override
+                  public boolean isDefinedAt(LineageDatasetWithIdentifier dataset) {
+                    return true;
+                  }
+
+                  @Override
+                  public void apply(
+                      LineageDatasetWithIdentifier dataset, DatasetFacetsBuilder builder) {
+                    builder.schema(
+                        context
+                            .getOpenLineage()
+                            .newSchemaDatasetFacetBuilder()
+                            .fields(
+                                List.of(
+                                    context
+                                        .getOpenLineage()
+                                        .newSchemaDatasetFacetFieldsBuilder()
+                                        .name("id")
+                                        .type(
+                                            dataset.getFlinkDataset() == second
+                                                ? secondType
+                                                : "BIGINT")
+                                        .build()))
+                            .build());
+                  }
+                }));
+    converter = new LineageGraphConverter(context, visitorFactory);
+  }
+
+  @Test
   void testJobType() {
     SourceLineageVertex source1 =
         sourceVertexOf(Boundedness.CONTINUOUS_UNBOUNDED, Collections.emptyList());
@@ -560,6 +633,54 @@ class LineageGraphConverterTest {
             OpenLineageClientUtils.newObjectMapper()
                 .readTree(
                     "[{\"namespace\":\"ns\",\"name\":\"T\",\"field\":\"a\",\"transformations\":[{\"type\":\"DIRECT\"},{\"type\":\"INDIRECT\"}]}]"));
+  }
+
+  @Test
+  void partialColumnsRetainSupportedSinkAndCompleteTablePairs() {
+    LineageDataset source = lineageDatasetOf("source", "ns").getFlinkDataset();
+    LineageDataset supported = lineageDatasetOf("supported", "ns").getFlinkDataset();
+    LineageDataset unsupported = lineageDatasetOf("unsupported", "ns").getFlinkDataset();
+    SourceLineageVertex sourceVertex = sourceVertexOf(Boundedness.BOUNDED, List.of(source));
+    LineageVertex supportedVertex = vertexOf(supported), unsupportedVertex = vertexOf(unsupported);
+    when(graph.sources()).thenReturn(List.of(sourceVertex));
+    when(graph.sinks()).thenReturn(List.of(supportedVertex, unsupportedVertex));
+    when(graph.relations())
+        .thenReturn(
+            List.of(
+                edgeOf(sourceVertex, supportedVertex), edgeOf(sourceVertex, unsupportedVertex)));
+    when(graph.columnRelations())
+        .thenReturn(
+            List.of(
+                relationOf(
+                    supported,
+                    "id",
+                    List.of(inputOf(source, "id", ColumnLineageDependencyType.DIRECT)),
+                    ColumnLineageOrigin.INPUT_FIELDS,
+                    null)));
+    OpenLineage.RunEvent event =
+        converter.convert(
+            new LineageGraphObservation(
+                graph,
+                "COMPLETE",
+                "PARTIAL",
+                List.of("unsupported: columns unavailable"),
+                Map.of("ns", Map.of("supported", "COMPLETE", "unsupported", "UNAVAILABLE"))),
+            EventType.START);
+    assertThat(event.getOutputs().get(0).getFacets().getColumnLineage()).isNotNull();
+    assertThat(event.getOutputs().get(1).getFacets().getColumnLineage()).isNull();
+    assertThat(event.getJob().getFacets().getLineage().getEntries()).hasSize(2);
+    assertThat(OpenLineageClientUtils.toJson(event)).contains("\"columnStatus\":\"PARTIAL\"");
+    assertThat(
+            OpenLineageClientUtils.newObjectMapper()
+                .valueToTree(event)
+                .path("run")
+                .path("facets")
+                .path("flink_lineage")
+                .path("columnStatuses"))
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .valueToTree(
+                    Map.of("ns", Map.of("supported", "COMPLETE", "unsupported", "UNAVAILABLE"))));
   }
 
   @Test

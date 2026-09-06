@@ -50,24 +50,27 @@ run(direct.dir, 'execute', direct.sql);
 const directFields = verify(direct.dir);
 console.log('PASS: SQL Client direct batch execution, real data and complete lineage');
 
-const negative = prepare('incomplete');
-const gatePlan = path.join(negative.dir, 'gate-plan.json');
-run(negative.dir, 'compile-gate', negative.sql.split('EXECUTE STATEMENT SET')[0]
-  + "COMPILE PLAN '" + gatePlan + "' FOR INSERT INTO Detail SELECT order_id, 'fixed', amount + fee FROM Orders;\n");
-const corrupted = JSON.parse(fs.readFileSync(gatePlan, 'utf8'));
-function removeLineage(node) {
+function removeLineage(node, key) {
   if (!node || typeof node !== 'object') return 0;
-  let count = Object.hasOwn(node, 'columnLineage') ? 1 : 0;
-  delete node.columnLineage;
-  for (const child of Object.values(node)) count += removeLineage(child);
+  let count = Object.hasOwn(node, key) ? 1 : 0;
+  delete node[key];
+  for (const child of Object.values(node)) count += removeLineage(child, key);
   return count;
 }
-assert.equal(removeLineage(corrupted), 1);
-const badPlan = path.join(negative.dir, 'incomplete-plan.json');
-fs.writeFileSync(badPlan, JSON.stringify(corrupted));
-run(negative.dir, 'incomplete', negative.sql.split('CREATE TABLE Orders')[0] + "EXECUTE PLAN '" + badPlan + "';\n");
-verify.incomplete(negative.dir);
-console.log('PASS: valid plan with incomplete lineage executes with explicit unavailable status');
+for (const mode of ['incomplete', 'legacy']) {
+  const negative = prepare(mode);
+  const gatePlan = path.join(negative.dir, 'gate-plan.json');
+  run(negative.dir, 'compile-gate', negative.sql.split('EXECUTE STATEMENT SET')[0]
+    + "COMPILE PLAN '" + gatePlan + "' FOR INSERT INTO Detail SELECT order_id, 'fixed', amount + fee FROM Orders;\n");
+  const corrupted = JSON.parse(fs.readFileSync(gatePlan, 'utf8'));
+  assert.equal(removeLineage(corrupted, 'columnLineage'), 1);
+  if (mode === 'legacy') assert.equal(removeLineage(corrupted, 'tableLineage'), 1);
+  const badPlan = path.join(negative.dir, 'incomplete-plan.json');
+  fs.writeFileSync(badPlan, JSON.stringify(corrupted));
+  run(negative.dir, mode, negative.sql.split('CREATE TABLE Orders')[0] + "EXECUTE PLAN '" + badPlan + "';\n");
+  verify.incomplete(negative.dir, mode === 'legacy');
+  console.log('PASS: ' + mode + ' plan executes with unavailable columns and honest independent table status');
+}
 
 const restored = prepare('restored');
 const planFile = path.join(restored.dir, 'plan.json');
@@ -82,4 +85,24 @@ const prelude = restored.sql.split('CREATE TABLE Orders')[0];
 run(restored.dir, 'restore', prelude + "EXECUTE PLAN '" + planFile + "';\n");
 assert.deepEqual(verify(restored.dir), directFields, 'Direct and restored field lineage must match');
 console.log('PASS: disk plan restored in a fresh SQL Client process without original views/tables');
+const mixedTemplate = fs.readFileSync(path.join(__dirname, 'mixed.sql'), 'utf8');
+let mixedFields;
+for (const mode of ['mixed', 'mixed-restored']) {
+  const dir = path.join(root, mode);
+  fs.mkdirSync(dir);
+  fs.writeFileSync(path.join(dir, 'numbers.csv'), '1\n2\n3\n');
+  fs.writeFileSync(path.join(dir, 'other-numbers.csv'), '2\n3\n4\n');
+  const sql = mixedTemplate.replaceAll('__ROOT__', dir.replaceAll("'", "''"));
+  if (mode === 'mixed') {
+    run(dir, 'execute', sql);
+    mixedFields = verify.mixed(dir);
+  } else {
+    const mixedPlan = path.join(dir, 'plan.json');
+    run(dir, 'compile', sql.replace('EXECUTE STATEMENT SET', "COMPILE PLAN '" + mixedPlan + "' FOR STATEMENT SET"));
+    assert.ok(!fs.existsSync(path.join(dir, 'events.jsonl')), 'Mixed compilation must not submit');
+    run(dir, 'restore', sql.split('CREATE DATABASE')[0] + "EXECUTE PLAN '" + mixedPlan + "';\n");
+    assert.deepEqual(verify.mixed(dir), mixedFields, 'Mixed sink lineage survives compiled restore');
+  }
+  console.log('PASS: ' + mode + ' exact data, complete table lineage and per-sink column availability');
+}
 console.log('ALL SQL CLIENT ACCEPTANCE CHECKS PASSED: ' + root);

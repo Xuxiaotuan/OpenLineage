@@ -5,6 +5,7 @@
 
 package io.openlineage.flink.converter;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.openlineage.client.OpenLineage;
 import io.openlineage.client.OpenLineage.ColumnLineageDatasetFacet;
 import io.openlineage.client.OpenLineage.ColumnLineageDatasetFacetFieldsBuilder;
@@ -14,6 +15,7 @@ import io.openlineage.client.OpenLineage.InputField;
 import io.openlineage.client.OpenLineage.InputFieldTransformations;
 import io.openlineage.client.OpenLineage.InputFieldTransformationsBuilder;
 import io.openlineage.client.OpenLineage.OutputDataset;
+import io.openlineage.client.OpenLineageClientUtils;
 import io.openlineage.client.dataset.namespace.resolver.DatasetNamespaceCombinedResolver;
 import io.openlineage.client.utils.DatasetIdentifier;
 import io.openlineage.flink.api.OpenLineageContext;
@@ -38,6 +40,7 @@ import org.apache.flink.streaming.api.lineage.LineageVertex;
 
 /** Class used to extract datasets from Flink lineage graph. */
 class OpenLineageDatasetExtractor {
+  private static final ObjectMapper DATASET_MAPPER = OpenLineageClientUtils.newObjectMapper();
   private final OpenLineageContext context;
   private final Collection<DatasetFacetVisitor> facetVisitors;
   private final Collection<DatasetIdentifierVisitor> identifierVisitors;
@@ -125,19 +128,20 @@ class OpenLineageDatasetExtractor {
     if (graph == null) {
       return Collections.emptyList();
     }
-    return graph.sources().stream()
-        .flatMap(source -> source.datasets().stream())
-        .flatMap(d -> extractDatasetsWithIdentifiers(d).stream())
-        .map(
-            d ->
-                context
-                    .getOpenLineage()
-                    .newInputDatasetBuilder()
-                    .namespace(d.getDatasetIdentifier().getNamespace())
-                    .name(d.getDatasetIdentifier().getName())
-                    .facets(convert(d))
-                    .build())
-        .collect(Collectors.toList());
+    return uniqueDatasets(
+        graph.sources().stream()
+            .flatMap(source -> source.datasets().stream())
+            .flatMap(d -> extractDatasetsWithIdentifiers(d).stream())
+            .map(
+                d ->
+                    context
+                        .getOpenLineage()
+                        .newInputDatasetBuilder()
+                        .namespace(d.getDatasetIdentifier().getNamespace())
+                        .name(d.getDatasetIdentifier().getName())
+                        .facets(convert(d))
+                        .build())
+            .collect(Collectors.toList()));
   }
 
   List<OutputDataset> extractOutputs(LineageGraph graph) {
@@ -150,19 +154,33 @@ class OpenLineageDatasetExtractor {
       return Collections.emptyList();
     }
 
-    return graph.sinks().stream()
-        .flatMap(sink -> sink.datasets().stream())
-        .flatMap(d -> extractDatasetsWithIdentifiers(d).stream())
-        .map(
-            d ->
-                context
-                    .getOpenLineage()
-                    .newOutputDatasetBuilder()
-                    .namespace(d.getDatasetIdentifier().getNamespace())
-                    .name(d.getDatasetIdentifier().getName())
-                    .facets(convert(d, columnRelations))
-                    .build())
-        .collect(Collectors.toList());
+    return uniqueDatasets(
+        graph.sinks().stream()
+            .flatMap(sink -> sink.datasets().stream())
+            .flatMap(d -> extractDatasetsWithIdentifiers(d).stream())
+            .map(
+                d ->
+                    context
+                        .getOpenLineage()
+                        .newOutputDatasetBuilder()
+                        .namespace(d.getDatasetIdentifier().getNamespace())
+                        .name(d.getDatasetIdentifier().getName())
+                        .facets(convert(d, columnRelations))
+                        .build())
+            .collect(Collectors.toList()));
+  }
+
+  private static <T extends OpenLineage.Dataset> List<T> uniqueDatasets(List<T> datasets) {
+    Map<List<String>, T> unique = new LinkedHashMap<>();
+    for (T dataset : datasets) {
+      List<String> identity = List.of(dataset.getNamespace(), dataset.getName());
+      T previous = unique.putIfAbsent(identity, dataset);
+      if (previous != null
+          && !DATASET_MAPPER.valueToTree(previous).equals(DATASET_MAPPER.valueToTree(dataset))) {
+        throw new IllegalStateException("Conflicting dataset definitions for " + identity);
+      }
+    }
+    return new ArrayList<>(unique.values());
   }
 
   private OpenLineage.DatasetFacets convert(LineageDatasetWithIdentifier dataset) {

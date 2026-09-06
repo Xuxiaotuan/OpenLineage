@@ -9,8 +9,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.mockConstruction;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -24,6 +26,7 @@ import io.openlineage.flink.api.OpenLineageContextFactory;
 import io.openlineage.flink.client.EventEmitter;
 import io.openlineage.flink.config.FlinkConfigParser;
 import io.openlineage.flink.config.FlinkOpenLineageConfig;
+import io.openlineage.flink.tracker.OpenLineageContinousJobTracker;
 import io.openlineage.flink.visitor.Flink2VisitorFactory;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -45,8 +48,290 @@ import org.apache.flink.streaming.runtime.execution.JobCreatedEvent;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.MockedConstruction;
 
 class OpenLineageJobStatusChangedListenerTest {
+  @Test
+  @SneakyThrows
+  void createdCallbackQueuedBeforeTerminalDoesNotRestartTracking() {
+    CircuitBreaker breaker = mock(CircuitBreaker.class);
+    java.util.List<Callable<?>> callbacks = new java.util.ArrayList<>();
+    when(breaker.run(any()))
+        .thenAnswer(
+            invocation -> {
+              callbacks.add(invocation.getArgument(0));
+              return null;
+            });
+    OpenLineageContext template =
+        OpenLineageContextFactory.fromConfig(FlinkConfigParser.parse(context.getConfiguration()))
+            .circuitBreaker(breaker)
+            .build();
+    try (MockedConstruction<OpenLineageContinousJobTracker> trackers =
+        mockConstruction(OpenLineageContinousJobTracker.class)) {
+      listener = new OpenLineageJobStatusChangedListener(template, factory);
+      JobID id = new JobID(1, 2);
+      listener.onEvent(created(id, "job-a", "COMPLETE"));
+      listener.onEvent(
+          new DefaultJobExecutionStatusEvent(
+              id, "job-a", JobStatus.RUNNING, JobStatus.FINISHED, null));
+      callbacks.get(0).call();
+      callbacks.get(1).call();
+      assertThat(trackers.constructed()).hasSize(1);
+      verify(trackers.constructed().get(0), times(1)).stopTracking();
+      verify(trackers.constructed().get(0), times(0)).startTracking(any(), any());
+    }
+  }
+
+  @Test
+  @SneakyThrows
+  void rejectedTerminalCallbackStillStopsTrackerAndSuppressesLateCreated() {
+    CircuitBreaker breaker = mock(CircuitBreaker.class);
+    java.util.concurrent.atomic.AtomicBoolean accept =
+        new java.util.concurrent.atomic.AtomicBoolean(true);
+    when(breaker.run(any()))
+        .thenAnswer(
+            invocation -> accept.get() ? ((Callable<?>) invocation.getArgument(0)).call() : null);
+    OpenLineageContext template =
+        OpenLineageContextFactory.fromConfig(FlinkConfigParser.parse(context.getConfiguration()))
+            .circuitBreaker(breaker)
+            .build();
+    try (MockedConstruction<OpenLineageContinousJobTracker> trackers =
+        mockConstruction(
+            OpenLineageContinousJobTracker.class,
+            (tracker, ignored) ->
+                doThrow(new IllegalStateException("close failed")).when(tracker).stopTracking())) {
+      listener = new OpenLineageJobStatusChangedListener(template, factory);
+      JobID id = new JobID(1, 2);
+      listener.onEvent(created(id, "job-a", "COMPLETE"));
+      accept.set(false);
+      listener.onEvent(
+          new DefaultJobExecutionStatusEvent(
+              id, "job-a", JobStatus.RUNNING, JobStatus.FINISHED, null));
+      verify(trackers.constructed().get(0), times(1)).stopTracking();
+      accept.set(true);
+      listener.onEvent(created(id, "job-a", "COMPLETE"));
+      assertThat(trackers.constructed()).hasSize(1);
+    }
+  }
+
+  @Test
+  void perJobStateDoesNotMutateSuppliedContextTemplate() {
+    FlinkOpenLineageConfig config = FlinkConfigParser.parse(context.getConfiguration());
+    OpenLineageContext template = OpenLineageContextFactory.fromConfig(config).build();
+    OpenLineageContext.JobIdentifier original =
+        OpenLineageContext.JobIdentifier.builder()
+            .jobName("template-job")
+            .jobNamespace("template-ns")
+            .build();
+    template.setJobId(original);
+    UUID originalRun = template.getRunUuid();
+    listener = new OpenLineageJobStatusChangedListener(template, factory);
+    listener.onEvent(created(new JobID(1, 2), "job-a", "COMPLETE"));
+    listener.onEvent(created(new JobID(3, 4), "job-b", "UNAVAILABLE"));
+    assertThat(template.getJobId()).isSameAs(original);
+    assertThat(template.getRunUuid()).isEqualTo(originalRun);
+  }
+
+  @Test
+  @SneakyThrows
+  void terminalOnlyListenerRetainsPerSinkColumnStatuses() {
+    listener = new OpenLineageJobStatusChangedListener(context, factory);
+    listener.onEvent(
+        new DefaultJobExecutionStatusEvent(
+            new JobID(1, 2),
+            "mixed-job",
+            JobStatus.RUNNING,
+            JobStatus.FINISHED,
+            null,
+            Map.of(
+                DefaultJobExecutionStatusEvent.LINEAGE_TABLE_STATUS,
+                "COMPLETE",
+                DefaultJobExecutionStatusEvent.LINEAGE_COLUMN_STATUS,
+                "PARTIAL",
+                "internal.lineage.column-statuses",
+                "{\"warehouse\":{\"good\":\"COMPLETE\",\"bad\":\"UNAVAILABLE\"}}")));
+    RunEvent event =
+        OpenLineageClientUtils.runEventFromJson(
+            Files.readAllLines(Path.of(eventFileLocation)).get(0));
+    com.fasterxml.jackson.databind.JsonNode status =
+        OpenLineageClientUtils.newObjectMapper()
+            .valueToTree(event)
+            .path("run")
+            .path("facets")
+            .path("flink_lineage");
+    assertThat(status.path("columnStatus").asText()).isEqualTo("PARTIAL");
+    assertThat(status.path("columnStatuses"))
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree("{\"warehouse\":{\"good\":\"COMPLETE\",\"bad\":\"UNAVAILABLE\"}}"));
+  }
+
+  @Test
+  void checkpointFailureIsIsolatedAndLateCallbackIsIgnored() {
+    java.util.List<java.util.function.Consumer<io.openlineage.flink.client.CheckpointFacet>>
+        callbacks = new java.util.ArrayList<>();
+    try (MockedConstruction<OpenLineageContinousJobTracker> trackers =
+            mockConstruction(
+                OpenLineageContinousJobTracker.class,
+                (tracker, ignored) ->
+                    doAnswer(
+                            call -> {
+                              callbacks.add(call.getArgument(1));
+                              return null;
+                            })
+                        .when(tracker)
+                        .startTracking(any(), any()));
+        MockedConstruction<EventEmitter> emitters =
+            mockConstruction(
+                EventEmitter.class,
+                (emitter, ignored) ->
+                    doAnswer(
+                            call -> {
+                              RunEvent event = call.getArgument(0);
+                              if (event.getEventType() == EventType.RUNNING)
+                                throw new IllegalStateException("checkpoint transport failure");
+                              return null;
+                            })
+                        .when(emitter)
+                        .emit(any(RunEvent.class)))) {
+      context.getConfiguration().setString("openlineage.disableCheckpointTracking", "false");
+      listener = new OpenLineageJobStatusChangedListener(context, factory);
+      listener.onEvent(created(new JobID(1, 2), "job", "COMPLETE"));
+      io.openlineage.flink.client.CheckpointFacet checkpoint =
+          new io.openlineage.flink.client.CheckpointFacet(1, 0, 0, 0, 1);
+      assertThatCode(() -> callbacks.get(0).accept(checkpoint)).doesNotThrowAnyException();
+      listener.onEvent(
+          new DefaultJobExecutionStatusEvent(
+              new JobID(1, 2), "job", JobStatus.RUNNING, JobStatus.FINISHED, null));
+      callbacks.get(0).accept(checkpoint);
+      verify(emitters.constructed().get(0), times(3)).emit(any(RunEvent.class));
+      verify(trackers.constructed().get(0)).stopTracking();
+    }
+  }
+
+  @Test
+  void allTerminalStatesStopTrackerEvenWhenEmissionFails() {
+    for (JobStatus terminal : List.of(JobStatus.FINISHED, JobStatus.FAILED, JobStatus.CANCELED)) {
+      try (MockedConstruction<OpenLineageContinousJobTracker> trackers =
+              mockConstruction(OpenLineageContinousJobTracker.class);
+          MockedConstruction<EventEmitter> emitters =
+              mockConstruction(
+                  EventEmitter.class,
+                  (emitter, ignored) ->
+                      doAnswer(
+                              call -> {
+                                RunEvent event = call.getArgument(0);
+                                if (event.getEventType() != EventType.START) {
+                                  throw new IllegalStateException("terminal transport failure");
+                                }
+                                return null;
+                              })
+                          .when(emitter)
+                          .emit(any(RunEvent.class)))) {
+        context.getConfiguration().setString("openlineage.disableCheckpointTracking", "false");
+        context.getConfiguration().setString("openlineage.disableCheckpointTracking", "false");
+        listener = new OpenLineageJobStatusChangedListener(context, factory);
+        listener.onEvent(created(new JobID(1, 2), "job", "COMPLETE"));
+        assertThatCode(
+                () ->
+                    listener.onEvent(
+                        new DefaultJobExecutionStatusEvent(
+                            new JobID(1, 2), "job", JobStatus.RUNNING, terminal, null)))
+            .doesNotThrowAnyException();
+        verify(trackers.constructed().get(0), times(1)).stopTracking();
+      }
+    }
+  }
+
+  @Test
+  @SneakyThrows
+  void createdAndInitializingEmitOnlyOneStart() {
+    try (MockedConstruction<OpenLineageContinousJobTracker> trackers =
+        mockConstruction(OpenLineageContinousJobTracker.class)) {
+      context.getConfiguration().setString("openlineage.disableCheckpointTracking", "false");
+      listener = new OpenLineageJobStatusChangedListener(context, factory);
+      JobCreatedEvent created = created(new JobID(1, 2), "job", "COMPLETE");
+      listener.onEvent(created);
+      listener.onEvent(created);
+      listener.onEvent(
+          new DefaultJobExecutionStatusEvent(
+              new JobID(1, 2), "job", JobStatus.CREATED, JobStatus.INITIALIZING, null));
+      List<RunEvent> events =
+          Files.readAllLines(Path.of(eventFileLocation)).stream()
+              .map(OpenLineageClientUtils::runEventFromJson)
+              .collect(Collectors.toList());
+      assertThat(events).extracting(RunEvent::getEventType).containsExactly(EventType.START);
+      verify(trackers.constructed().get(0), times(1)).startTracking(any(), any());
+    }
+  }
+
+  @Test
+  @SneakyThrows
+  void initializingBeforeCreatedDoesNotReplaceRichStart() {
+    listener = new OpenLineageJobStatusChangedListener(context, factory);
+    listener.onEvent(
+        new DefaultJobExecutionStatusEvent(
+            new JobID(1, 2), "job", JobStatus.CREATED, JobStatus.INITIALIZING, null));
+    listener.onEvent(created(new JobID(1, 2), "job", "COMPLETE"));
+    List<RunEvent> events =
+        Files.readAllLines(Path.of(eventFileLocation)).stream()
+            .map(OpenLineageClientUtils::runEventFromJson)
+            .collect(Collectors.toList());
+    assertThat(events).extracting(RunEvent::getEventType).containsExactly(EventType.START);
+    assertThat(OpenLineageClientUtils.toJson(events.get(0)))
+        .contains("\"tableStatus\":\"COMPLETE\"");
+  }
+
+  @Test
+  @SneakyThrows
+  void interleavedJobsKeepTheirOwnIdentityStatusAndTracker() {
+    try (MockedConstruction<OpenLineageContinousJobTracker> trackers =
+        mockConstruction(OpenLineageContinousJobTracker.class)) {
+      context.getConfiguration().setString("openlineage.disableCheckpointTracking", "false");
+      listener = new OpenLineageJobStatusChangedListener(context, factory);
+      JobID a = new JobID(1, 2), b = new JobID(3, 4);
+      listener.onEvent(created(a, "job-a", "COMPLETE"));
+      listener.onEvent(created(b, "job-b", "UNAVAILABLE"));
+      listener.onEvent(
+          new DefaultJobExecutionStatusEvent(
+              a, "job-a", JobStatus.RUNNING, JobStatus.FINISHED, null));
+      listener.onEvent(
+          new DefaultJobExecutionStatusEvent(
+              b, "job-b", JobStatus.RUNNING, JobStatus.FAILED, null));
+      List<RunEvent> events =
+          Files.readAllLines(Path.of(eventFileLocation)).stream()
+              .map(OpenLineageClientUtils::runEventFromJson)
+              .collect(Collectors.toList());
+      assertThat(events)
+          .extracting(e -> e.getJob().getName())
+          .containsExactly("job-a", "job-b", "job-a", "job-b");
+      assertThat(events.get(0).getRun().getRunId()).isEqualTo(events.get(2).getRun().getRunId());
+      assertThat(events.get(1).getRun().getRunId()).isEqualTo(events.get(3).getRun().getRunId());
+      assertThat(events.get(0).getRun().getRunId()).isNotEqualTo(events.get(1).getRun().getRunId());
+      assertThat(OpenLineageClientUtils.toJson(events.get(2)))
+          .contains("\"tableStatus\":\"COMPLETE\"");
+      assertThat(OpenLineageClientUtils.toJson(events.get(3)))
+          .contains("\"tableStatus\":\"UNAVAILABLE\"");
+      assertThat(trackers.constructed()).hasSize(2);
+      for (OpenLineageContinousJobTracker tracker : trackers.constructed())
+        verify(tracker).stopTracking();
+    }
+  }
+
+  private JobCreatedEvent created(JobID id, String name, String status) {
+    JobCreatedEvent event = mock(JobCreatedEvent.class);
+    when(event.jobId()).thenReturn(id);
+    when(event.jobName()).thenReturn(name);
+    when(event.lineageGraph())
+        .thenReturn(
+            new LineageGraphObservation(
+                org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build(),
+                status,
+                status,
+                List.of()));
+    return event;
+  }
+
   @Test
   @SneakyThrows
   void conversionFailurePublishesUnavailableStatusForWholeLifecycle() {
@@ -55,6 +340,7 @@ class OpenLineageJobStatusChangedListenerTest {
     when(invalidGraph.sources())
         .thenThrow(new IllegalArgumentException("invalid dataset identity"));
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("conversion-failed-job");
     when(createdEvent.lineageGraph())
         .thenReturn(new LineageGraphObservation(invalidGraph, "COMPLETE", "COMPLETE", List.of()));
@@ -104,6 +390,7 @@ class OpenLineageJobStatusChangedListenerTest {
         OpenLineageContextFactory.fromConfig(config).eventEmitter(emitter).build();
     listener = new OpenLineageJobStatusChangedListener(lineageContext, factory);
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("transport-failed-job");
     assertThatCode(() -> listener.onEvent(createdEvent)).doesNotThrowAnyException();
     verify(emitter, times(1)).emit(any(RunEvent.class));
@@ -114,6 +401,7 @@ class OpenLineageJobStatusChangedListenerTest {
   void missingLineagePublishesUnavailableStatusAndLifecycle() {
     listener = new OpenLineageJobStatusChangedListener(context, factory);
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("lineage-failed-job");
     listener.onEvent(createdEvent);
     listener.onEvent(
@@ -151,7 +439,9 @@ class OpenLineageJobStatusChangedListenerTest {
                 "openlineage.transport.type",
                 "file",
                 "openlineage.transport.location",
-                eventFileLocation));
+                eventFileLocation,
+                "openlineage.disableCheckpointTracking",
+                "true"));
 
     when(context.getConfiguration()).thenReturn(configuration);
   }
@@ -166,6 +456,7 @@ class OpenLineageJobStatusChangedListenerTest {
   void testOnEventForJobCreated() {
     listener = new OpenLineageJobStatusChangedListener(context, factory);
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("event-job-name");
     when(createdEvent.lineageGraph())
         .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
@@ -203,6 +494,7 @@ class OpenLineageJobStatusChangedListenerTest {
 
     listener = new OpenLineageJobStatusChangedListener(context, factory);
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("event-job-name");
     when(createdEvent.lineageGraph())
         .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
@@ -240,6 +532,7 @@ class OpenLineageJobStatusChangedListenerTest {
 
     listener = new OpenLineageJobStatusChangedListener(context, factory);
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("event-job-name");
     when(createdEvent.lineageGraph())
         .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
@@ -267,6 +560,7 @@ class OpenLineageJobStatusChangedListenerTest {
 
     // emit start event
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("event-job-name");
     when(createdEvent.lineageGraph())
         .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
@@ -308,6 +602,7 @@ class OpenLineageJobStatusChangedListenerTest {
 
     // emit start event
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("event-job-name");
     when(createdEvent.lineageGraph())
         .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());
@@ -336,6 +631,7 @@ class OpenLineageJobStatusChangedListenerTest {
 
     // emit start event
     JobCreatedEvent createdEvent = mock(JobCreatedEvent.class);
+    when(createdEvent.jobId()).thenReturn(new JobID(1, 2));
     when(createdEvent.jobName()).thenReturn("event-job-name");
     when(createdEvent.lineageGraph())
         .thenReturn(org.apache.flink.streaming.api.lineage.DefaultLineageGraph.builder().build());

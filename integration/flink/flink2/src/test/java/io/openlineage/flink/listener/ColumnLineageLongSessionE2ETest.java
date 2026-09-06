@@ -181,12 +181,13 @@ public class ColumnLineageLongSessionE2ETest {
     for (RunEvent event : events) {
       JsonNode status = MAPPER.valueToTree(event).path("run").path("facets").path("flink_lineage");
       assertThat(status.path("columnStatus").asText()).isEqualTo("UNAVAILABLE");
+      assertThat(status.path("tableStatus").asText()).isEqualTo("COMPLETE");
       assertThat(status.path("issues").size()).isGreaterThan(0);
       if (event.getEventType() == EventType.START) {
         assertThat(event.getOutputs()).hasSize(2);
         assertThat(event.getOutputs())
             .allSatisfy(output -> assertThat(output.getFacets().getColumnLineage()).isNull());
-        assertThat(event.getJob().getFacets().getLineage()).isNull();
+        assertThat(event.getJob().getFacets().getLineage().getEntries()).hasSize(2);
       }
     }
   }

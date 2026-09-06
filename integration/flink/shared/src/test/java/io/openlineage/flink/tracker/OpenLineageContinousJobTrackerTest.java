@@ -8,9 +8,12 @@ package io.openlineage.flink.tracker;
 import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
 import static com.github.tomakehurst.wiremock.client.WireMock.configureFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
+import static com.github.tomakehurst.wiremock.client.WireMock.getRequestedFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
 import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
 import static com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
@@ -38,6 +41,72 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 class OpenLineageContinousJobTrackerTest {
+  @Test
+  @SneakyThrows
+  void stoppedTrackerCannotStartALateWorker() {
+    tracker.stopTracking();
+    tracker.startTracking(openLineageContext, onJobCheckpoint);
+    java.lang.reflect.Field field =
+        OpenLineageContinousJobTracker.class.getDeclaredField("trackingThread");
+    field.setAccessible(true);
+    assertThat(field.get(tracker)).isNull();
+  }
+
+  @Test
+  @SneakyThrows
+  void stopClosesAnInFlightPollingRequest() {
+    stubFor(
+        get(urlEqualTo(String.format(CHECKPOINTS_URL, jobID)))
+            .willReturn(
+                aResponse()
+                    .withFixedDelay(30000)
+                    .withBody(String.format(jsonCheckpointResponse, 0, 0))));
+    tracker.startTracking(openLineageContext, onJobCheckpoint);
+    java.lang.reflect.Field field =
+        OpenLineageContinousJobTracker.class.getDeclaredField("trackingThread");
+    field.setAccessible(true);
+    Thread worker = (Thread) field.get(tracker);
+    try {
+      await()
+          .atMost(Duration.ofSeconds(3))
+          .until(
+              () ->
+                  !wireMockServer
+                      .findAll(getRequestedFor(urlEqualTo(String.format(CHECKPOINTS_URL, jobID))))
+                      .isEmpty());
+      tracker.stopTracking();
+      await()
+          .atMost(Duration.ofSeconds(2))
+          .untilAsserted(() -> assertThat(worker.isAlive()).isFalse());
+    } finally {
+      tracker.stopTracking();
+      worker.join(2000);
+    }
+  }
+
+  @Test
+  @SneakyThrows
+  void stopInterruptsAnInitiallySleepingWorker() {
+    tracker =
+        new OpenLineageContinousJobTracker(Duration.ofSeconds(30), "http://localhost:18088/jobs");
+    tracker.startTracking(openLineageContext, onJobCheckpoint);
+    java.lang.reflect.Field field =
+        OpenLineageContinousJobTracker.class.getDeclaredField("trackingThread");
+    field.setAccessible(true);
+    Thread worker = (Thread) field.get(tracker);
+    await()
+        .atMost(Duration.ofSeconds(2))
+        .until(() -> worker.getState() == Thread.State.TIMED_WAITING);
+    try {
+      tracker.stopTracking();
+      await()
+          .atMost(Duration.ofSeconds(2))
+          .untilAsserted(() -> assertThat(worker.isAlive()).isFalse());
+    } finally {
+      worker.interrupt();
+      worker.join(2000);
+    }
+  }
 
   private static final String CHECKPOINTS = "checkpoints";
   private static final String SECOND_CHECKPOINT = "second checkpoint";

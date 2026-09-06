@@ -65,7 +65,63 @@ function verify(root) {
   return start.outputs.map(o => ({name: o.name, fields: o.facets.columnLineage.fields})).sort((a, b) => a.name.localeCompare(b.name));
 }
 module.exports = verify;
-module.exports.incomplete = function verifyIncomplete(root) {
+module.exports.terminal = function verifyTerminal(root, expectedType) {
+  assert.ok(['FAIL', 'ABORT'].includes(expectedType));
+  const events = fs.readFileSync(path.join(root, 'events.jsonl'), 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+  const starts = events.filter(e => e.eventType === 'START');
+  const terminal = events.filter(e => ['FAIL', 'ABORT', 'COMPLETE'].includes(e.eventType));
+  assert.equal(starts.length, 1);
+  assert.equal(terminal.length, 1, 'Exactly one terminal event');
+  assert.equal(terminal[0].eventType, expectedType);
+  assert.equal(terminal[0].run.runId, starts[0].run.runId);
+  const initial = starts[0].run.facets.flink_lineage;
+  assert.equal(initial.tableStatus, 'COMPLETE');
+  assert.equal(initial.columnStatus, 'COMPLETE');
+  assert.deepEqual(initial.issues, []);
+  assert.deepEqual(terminal[0].run.facets.flink_lineage, initial, 'Terminal status preserves lineage availability');
+};
+module.exports.mixed = function verifyMixed(root) {
+  assert.deepEqual(rows(path.join(root, 'good')), ['2', '3', '4']);
+  assert.deepEqual(rows(path.join(root, 'unsupported')), ['2', '3']);
+  const events = fs.readFileSync(path.join(root, 'events.jsonl'), 'utf8').trim().split(/\r?\n/).map(JSON.parse);
+  const starts = events.filter(e => e.eventType === 'START');
+  const terminal = events.filter(e => ['COMPLETE', 'ABORT', 'FAIL'].includes(e.eventType));
+  assert.equal(starts.length, 1);
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].eventType, 'COMPLETE');
+  assert.equal(terminal[0].run.runId, starts[0].run.runId);
+  const namespace = 'flink://catalog/default_catalog';
+  const name = table => '`default_catalog`.`lineage_acceptance`.`' + table + '`';
+  for (const event of [starts[0], terminal[0]]) {
+    const status = event.run.facets.flink_lineage;
+    assert.equal(status.tableStatus, 'COMPLETE');
+    assert.equal(status.columnStatus, 'PARTIAL');
+    assert.ok(status.issues.length > 0);
+    assert.deepEqual(status.columnStatuses, {[namespace]: {
+      [name('Good')]: 'COMPLETE', [name('Unsupported')]: 'UNAVAILABLE'
+    }});
+  }
+  const start = starts[0];
+  assert.deepEqual(start.inputs.map(i => i.name).sort(), [name('Numbers'), name('OtherNumbers')]);
+  assert.deepEqual(start.outputs.map(o => o.name).sort(), [name('Good'), name('Unsupported')]);
+  for (const dataset of [...start.inputs, ...start.outputs]) assert.equal(dataset.namespace, namespace);
+  const pairs = start.job.facets.lineage.entries.flatMap(o => o.inputs.map(i => i.name + ' -> ' + o.name));
+  assert.deepEqual(pairs.sort(), [name('Numbers') + ' -> ' + name('Good'),
+    name('Numbers') + ' -> ' + name('Unsupported'), name('OtherNumbers') + ' -> ' + name('Unsupported')].sort());
+  const good = start.outputs.find(o => o.name === name('Good'));
+  const unsupported = start.outputs.find(o => o.name === name('Unsupported'));
+  assert.ok(!unsupported.facets?.columnLineage, 'Unsupported sink must not have a column facet');
+  const fields = good.facets.columnLineage.fields;
+  assert.deepEqual(Object.keys(fields), ['value']);
+  assert.equal(fields.value.inputFields.length, 1);
+  const input = fields.value.inputFields[0];
+  assert.equal(input.namespace, namespace);
+  assert.equal(input.name, name('Numbers'));
+  assert.equal(input.field, 'value');
+  assert.deepEqual(input.transformations.map(t => t.type), ['DIRECT']);
+  return {fields, columnStatuses: start.run.facets.flink_lineage.columnStatuses};
+};
+module.exports.incomplete = function verifyIncomplete(root, legacy = false) {
   assert.deepEqual(rows(path.join(root, 'detail')), ['1,fixed,105', '2,fixed,205', '3,fixed,55']);
   const events = fs.readFileSync(path.join(root, 'events.jsonl'), 'utf8').trim().split(/\r?\n/).map(JSON.parse);
   const starts = events.filter(e => e.eventType === 'START');
@@ -75,7 +131,7 @@ module.exports.incomplete = function verifyIncomplete(root) {
   assert.equal(completes[0].run.runId, starts[0].run.runId);
   for (const event of [starts[0], completes[0]]) {
     const status = event.run.facets.flink_lineage;
-    assert.equal(status.tableStatus, 'PARTIAL');
+    assert.equal(status.tableStatus, legacy ? 'PARTIAL' : 'COMPLETE');
     assert.equal(status.columnStatus, 'UNAVAILABLE');
     assert.ok(status.issues.length > 0, 'Unavailable lineage must explain why');
   }
@@ -84,7 +140,16 @@ module.exports.incomplete = function verifyIncomplete(root) {
   const identity = table => '`default_catalog`.`lineage_acceptance`.`' + table + '`';
   assert.deepEqual(starts[0].inputs.map(i => i.name), [identity('Orders')]);
   assert.deepEqual(starts[0].outputs.map(o => o.name), [identity('Detail')]);
-  assert.ok(!starts[0].job?.facets?.lineage, 'Partial table inventory must not claim exact table edges');
+  if (legacy) {
+    assert.ok(!starts[0].job?.facets?.lineage, 'Partial table inventory must not claim exact table edges');
+  } else {
+    const entries = starts[0].job.facets.lineage.entries;
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0].name, identity('Detail'));
+    assert.equal(entries[0].namespace, 'flink://catalog/default_catalog');
+    assert.deepEqual(entries[0].inputs.map(i => [i.namespace, i.name]),
+      [['flink://catalog/default_catalog', identity('Orders')]]);
+  }
   for (const output of starts[0].outputs) {
     assert.ok(!output.facets?.columnLineage, 'No column facet may claim completeness');
   }

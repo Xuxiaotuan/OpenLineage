@@ -38,7 +38,7 @@ The temporary distribution path intentionally avoids `flink-sql-client`:
 the upstream launcher's classpath regex can mistake that directory name for
 the SQL Client Jar and omit the actual Jar.
 
-## Required checks and current status (2026-09-06)
+## Required checks and historical evidence
 
 The script implements the single automatic observer policy. The checks below
 describe its current assertions. On 2026-09-06 the corresponding remote HTTP
@@ -46,8 +46,10 @@ acceptance checks passed against a freshly packaged distribution in Kubernetes:
 direct Session submission, incomplete-lineage execution, saved-plan restore and
 Application submission. Evidence is retained in
 `integration/flink/build/observer-poc-20260906/evidence/` from the repository root.
-This does not claim that this local-mode/file-transport runner was rerun; earlier
-local PASS results used an obsolete rejection assertion.
+Those historical artifacts reported PARTIAL table status after removing column
+metadata. Current plans serialize independent `tableLineage`, so the revised
+assertions below require stronger evidence. The 2026-09-06 results are not a pass
+claim for these new assertions or for the additional mixed/legacy fixtures.
 
 1. **Direct batch submission:** two filesystem/CSV sources, a filtered Join,
    temporary view and two StatementSet sinks. Checks exact rows
@@ -60,14 +62,27 @@ local PASS results used an obsolete rejection assertion.
    removes its one `columnLineage` property and attempts execution in another
    SQL Client process. Requires actual sink rows `1,fixed,105`, `2,fixed,205`
    and `3,fixed,55`, one START and one COMPLETE with the same run ID,
-   `tableStatus=PARTIAL`, `columnStatus=UNAVAILABLE`, diagnostic `issues`, known
-   input/output tables and no column facet. Missing optional lineage must not
+   `tableStatus=COMPLETE`, `columnStatus=UNAVAILABLE`, diagnostic `issues`, the
+   exact Orders-to-Detail table pair and no column facet. Independent serialized
+   `tableLineage` remains intact. Missing optional column lineage must not
    reject an otherwise valid job. Empty staging directories alone are not proof
    of execution; exact CSV rows are required.
 3. **Complex batch plan restore:** compiles the original dual-sink query,
    drops its temporary view, and restores it in a fresh SQL Client process with
    no original table/view definitions. Requires a serialized MultipleInput node
    and exact data/lineage equality with direct execution.
+4. **Legacy metadata absence:** a separate projection plan loses exactly one
+   `tableLineage` and one `columnLineage` property. Requires the same three output
+   rows, START/COMPLETE, PARTIAL table status, UNAVAILABLE columns, known table
+   inventories and no precise table-pair or column facet.
+5. **Mixed-sink direct and restored plans:** a supported projection writes
+   `2,3,4` to Good and INTERSECT writes `2,3` to Unsupported. Requires COMPLETE
+   table status and three precise source/sink pairs, PARTIAL column status,
+   `columnLineage` only on Good, and matching nested `columnStatuses` on START and
+   COMPLETE. Direct and fresh-process compiled restore must agree exactly.
+
+`columnStatuses` uses native Flink namespace/name keys; dataset visitors may map
+the standard OpenLineage output identities differently for other connectors.
 
 The restore fixture requires the paired Flink MultipleInput subgraph persistence
 repair. Before that repair, check 3 failed with `Missing type`. It requires more

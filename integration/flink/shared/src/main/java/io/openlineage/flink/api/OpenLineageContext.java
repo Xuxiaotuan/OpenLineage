@@ -32,7 +32,7 @@ import org.apache.flink.api.common.JobID;
  *
  * @apiNote This interface is evolving and may change in future releases
  */
-@Builder
+@Builder(toBuilder = true)
 @Getter
 @ToString
 public class OpenLineageContext {

@@ -29,8 +29,10 @@ validation; the automated end-to-end tests use MiniCluster and file transport.
 
 Lineage follows one automatic observer policy. The paired Flink build isolates
 lineage extraction, binding, connector metadata and graph-validation failures:
-otherwise valid jobs continue, and an invalid column-lineage bundle is discarded
-as a whole. Known runtime source and sink inventories remain visible when they
+otherwise valid jobs continue. Column lineage is retained only for output datasets
+whose sink writers are all validated; an unsupported writer does not erase
+independently validated columns for another output dataset. Known runtime source
+and sink inventories remain visible when they
 can be recovered. Actual SQL validation, connector construction and execution
 failures still fail the job.
 
@@ -40,13 +42,22 @@ metadata completeness:
 | Property | Values | Meaning |
 | --- | --- | --- |
 | `tableStatus` | `COMPLETE`, `PARTIAL`, `UNAVAILABLE` | Verified logical table dependencies, only known runtime tables, or unavailable table metadata |
-| `columnStatus` | `COMPLETE`, `UNAVAILABLE` | Verified complete column bundle or no column facet |
+| `columnStatus` | `COMPLETE`, `PARTIAL`, `UNAVAILABLE` | All, some, or none of the output datasets have validated complete column lineage |
+| `columnStatuses` | Namespace to dataset-name to status map | Per-output-dataset `COMPLETE` or `UNAVAILABLE`; multiple writers are judged together |
 | `issues` | Array of strings | Reasons for incomplete or unavailable metadata |
 
-For a valid plan whose optional lineage is missing, successful START/COMPLETE
-events can carry `tableStatus=PARTIAL`, `columnStatus=UNAVAILABLE` and diagnostic
-issues. These events retain known table inventories, but omit column facets and
-the precise `job.facets.lineage` mapping. If even table capture or OpenLineage
+`columnStatuses` uses native Flink dataset namespace/name keys so submission and
+JobManager snapshots remain consistent. Dataset visitors may rename the standard
+OpenLineage `outputs` identifiers; do not assume those renamed identifiers are the
+keys of this native diagnostic map.
+
+Table completeness is checked independently against the captured logical table
+dependencies, not inferred from column completeness or runtime topology alone.
+Thus `tableStatus=COMPLETE` with `columnStatus=UNAVAILABLE` still publishes precise
+table pairs. If independent table evidence is missing too, START/COMPLETE can
+carry `tableStatus=PARTIAL`, `columnStatus=UNAVAILABLE` and diagnostic issues;
+known table inventories remain, but the precise table-pair facet is omitted.
+If even table capture or OpenLineage
 conversion fails, the listener emits an unavailable observation without dataset
 claims. `COMPLETE` in an event's type describes job execution; it does not upgrade
 the lineage statuses.
@@ -59,7 +70,15 @@ through `DefaultJobExecutionStatusEvent.getLineageStatus()` for the terminal
 listener. This correlates lifecycle identity and metadata status; it does not
 guarantee event delivery. The combined targeted suite passed 44 tests, and the
 fresh Kubernetes Session and Application runs verified matching START/COMPLETE
-run IDs and completeness snapshots on 2026-09-06.
+run IDs and completeness snapshots on 2026-09-06. Those results predate the
+per-dataset observation changes and are not acceptance evidence for this revision.
+
+Listener state is isolated by Flink JobID. Only JobCreated produces START;
+INITIALIZING does not synthesize a second, metadata-free START. COMPLETE, FAIL
+and ABORT stop checkpoint tracking even if event construction or transport fails.
+This is listener-local duplicate suppression, not distributed exactly-once delivery.
+Reusing a fixed JobID for different submissions is outside the current run-identity
+contract: such submissions are not guaranteed distinct OpenLineage run IDs.
 
 Successful submission does not guarantee lineage availability or transport
 delivery. Performance optimization and benchmarking are outside this POC's scope;
@@ -121,8 +140,9 @@ supports source, input-format and legacy source-function providers. Providers
 that require executing a DataStream/transformation to
 obtain their identity, or ambiguous definitions for the same pruned table,
 remain explicit lineage errors, not execution vetoes. A missing lineage source
-or invalid lineage field invalidates the complete column bundle and precise
-logical table mapping; recovered runtime tables are only `PARTIAL`. A snapshot
+or invalid lineage field makes the affected output dataset's column lineage
+unavailable. Independently validated logical table metadata is preserved; when
+that evidence is missing, recovered runtime tables are only `PARTIAL`. A snapshot
 is not a general fallback for missing metadata.
 
 Output-wide transformation descriptions use the standard
@@ -153,8 +173,9 @@ not a claim to support every Flink SQL feature.
 | Intersect/Minus, recursive RepeatUnion/TableSpool, SEMI/ANTI joins | Unsupported by the current extraction path |
 
 Member access after operations that do not preserve explicit ROW component
-metadata remains unsupported. Unsupported extraction invalidates the column
-bundle and reports the issue while the valid Flink job continues. The paired
+metadata remains unsupported. Unsupported extraction invalidates the affected
+output dataset's column bundle and reports the issue while the valid Flink job
+continues; unrelated validated output datasets retain their column facets. The paired
 extractor's batch and streaming suites passed 72 tests on 2026-09-06, including
 red/green checks for Watermark and projected ROW selection; these are planner
 tests, not deployed SQL Client or external-service acceptance.

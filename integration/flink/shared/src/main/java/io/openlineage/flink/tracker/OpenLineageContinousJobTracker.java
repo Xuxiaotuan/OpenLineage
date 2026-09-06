@@ -21,6 +21,7 @@ import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
 import org.apache.hc.client5.http.impl.classic.HttpClients;
 import org.apache.hc.core5.http.ParseException;
 import org.apache.hc.core5.http.io.entity.EntityUtils;
+import org.apache.hc.core5.io.CloseMode;
 
 @Slf4j
 /**
@@ -33,9 +34,10 @@ public class OpenLineageContinousJobTracker {
   private final String jobsApiUrl;
 
   private Consumer<CheckpointFacet> onJobCheckpoint;
-  private Thread trackingThread;
+  private volatile Thread trackingThread;
+  private volatile CloseableHttpClient httpClient;
   private Optional<Checkpoints> latestCheckpoints = Optional.empty();
-  private boolean shouldContinue = true;
+  private volatile boolean shouldContinue = true;
 
   public OpenLineageContinousJobTracker(Duration trackingInterval, String jobsApiUrl) {
     this.trackingInterval = trackingInterval;
@@ -47,15 +49,18 @@ public class OpenLineageContinousJobTracker {
    *
    * @param context flink execution context
    */
-  public void startTracking(OpenLineageContext context, Consumer<CheckpointFacet> onJobCheckpoint) {
+  public synchronized void startTracking(
+      OpenLineageContext context, Consumer<CheckpointFacet> onJobCheckpoint) {
+    if (!shouldContinue) {
+      return;
+    }
     this.onJobCheckpoint = onJobCheckpoint;
-
-    CloseableHttpClient httpClient = HttpClients.createDefault();
 
     if (context.getJobId() == null || context.getJobId().getFlinkJobId() == null) {
       log.error("Cannot start tracking thread, JobId is null. Can happen only in tests");
       return;
     }
+    httpClient = HttpClients.createDefault();
 
     String url =
         String.format(
@@ -66,44 +71,52 @@ public class OpenLineageContinousJobTracker {
     trackingThread =
         (new Thread(
             () -> {
-              try {
-                log.debug(
-                    "Tracking thread started and sleeping {} seconds",
-                    trackingInterval.getSeconds());
-                Thread.sleep(trackingInterval.toMillis());
-              } catch (InterruptedException e) {
-                log.warn("Tracking thread interrupted", e);
-              }
-
-              while (shouldContinue) {
+              try (CloseableHttpClient client = httpClient) {
                 try {
-                  CloseableHttpResponse response = httpClient.execute(request);
-                  String json = EntityUtils.toString(response.getEntity());
-                  log.debug("Tracking thread response: {}", json);
-
-                  Optional.of(
-                          new ObjectMapper()
-                              .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
-                              .readValue(json, Checkpoints.class))
-                      .filter(
-                          newCheckpoints ->
-                              latestCheckpoints.isEmpty()
-                                  || latestCheckpoints.get().getCounts().getTotal()
-                                      != newCheckpoints.getCounts().getTotal())
-                      .ifPresentOrElse(
-                          this::emitNewCheckpointEvent, () -> log.info("no new checkpoint found"));
-                } catch (IOException | ParseException e) {
-                  log.error("Connecting REST API failed", e);
-                } catch (Exception e) {
-                  log.error("tracker thread failed due not unknown exception", e);
-                  shouldContinue = false;
-                }
-                try {
+                  log.debug(
+                      "Tracking thread started and sleeping {} seconds",
+                      trackingInterval.getSeconds());
                   Thread.sleep(trackingInterval.toMillis());
                 } catch (InterruptedException e) {
-                  log.warn("Tracking thread interrupted", e);
-                  shouldContinue = false;
+                  Thread.currentThread().interrupt();
+                  return;
                 }
+
+                while (shouldContinue) {
+                  try (CloseableHttpResponse response = client.execute(request)) {
+                    String json = EntityUtils.toString(response.getEntity());
+                    log.debug("Tracking thread response: {}", json);
+
+                    Optional.of(
+                            new ObjectMapper()
+                                .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+                                .readValue(json, Checkpoints.class))
+                        .filter(
+                            newCheckpoints ->
+                                latestCheckpoints.isEmpty()
+                                    || latestCheckpoints.get().getCounts().getTotal()
+                                        != newCheckpoints.getCounts().getTotal())
+                        .ifPresentOrElse(
+                            this::emitNewCheckpointEvent,
+                            () -> log.info("no new checkpoint found"));
+                  } catch (IOException | ParseException e) {
+                    log.error("Connecting REST API failed", e);
+                  } catch (Exception e) {
+                    log.error("tracker thread failed due not unknown exception", e);
+                    shouldContinue = false;
+                  }
+                  try {
+                    if (!shouldContinue) {
+                      break;
+                    }
+                    Thread.sleep(trackingInterval.toMillis());
+                  } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    shouldContinue = false;
+                  }
+                }
+              } catch (IOException e) {
+                log.warn("Closing checkpoint HTTP client failed", e);
               }
             }));
     log.info(
@@ -126,8 +139,16 @@ public class OpenLineageContinousJobTracker {
   }
 
   /** Stops the tracking thread */
-  public void stopTracking() {
+  public synchronized void stopTracking() {
     log.info("stop tracking");
     shouldContinue = false;
+    Thread worker = trackingThread;
+    if (worker != null) {
+      worker.interrupt();
+    }
+    CloseableHttpClient client = httpClient;
+    if (client != null) {
+      client.close(CloseMode.IMMEDIATE);
+    }
   }
 }
