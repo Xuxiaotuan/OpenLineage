@@ -230,6 +230,34 @@ real Kafka/Paimon connectors, remote transport delivery or SQL Gateway deploymen
 
 ### SQL Client distribution acceptance
 
+#### Verified independent-observation revision (2026-09-07, Asia/Shanghai)
+
+The fresh local Kubernetes image `flink-lineage-local:isolated-20260907` was built
+from clean Flink `fe22cf714bb7ab567fe13cf0ad9abb834e34da42` and OpenLineage
+`a85ea412d2eb2afedfaf31c6dca04e9dd2e8a25b` source checkouts. Its image ID is
+`sha256:a32bdb5bf45715385c586fbe9409110071fa46c7ac814dacdfb7fc0ca92de94b`.
+The adapter SHA-256 is
+`f54fab26c5a23b85887c84ee64bda0e1b33318bffe0d77ee654774bb5ebd7cd1`.
+
+All nine remote checks passed: direct SQL, column-only metadata loss, legacy
+table-and-column metadata loss, mixed supported/unsupported sinks, mixed saved
+plan restore, complex batch restore, cancellation, runtime CAST failure and
+Application mode. Successful jobs require exact CSV rows and HTTP lineage;
+cancellation/failure require actual CANCELED/FAILED job states and matching
+ABORT/FAIL events. Mixed sinks retain three exact table pairs and only the
+supported output's column facet, with identical per-output statuses at START
+and COMPLETE. Unsupported columns do not veto execution.
+
+The revision passed 82 targeted Flink tests and 63 targeted OpenLineage tests,
+including 12 MiniCluster boundary/StatementSet/long-session tests. These are
+targeted regressions, not full upstream CI. Fresh-build evidence is local under
+`build/isolated-poc-20260907/`: `build-provenance.json`, all 14 distribution-lib
+hashes, image metadata, manifests, and `evidence/results.json`,
+`evidence/verification.txt`, raw events, data and logs. Initial cancellation SQL
+used an unquoted reserved identifier and failed before submission; its log is
+retained alongside the corrected successful run. Collector outage was not
+rerun on this image; the 2026-09-06 outage evidence below remains historical.
+
 The opt-in [SQL Client acceptance script](flink2/src/test/scripts/sql-client-lineage/README.md)
 uses a real paired distribution, the adapter in `lib`, and filesystem/CSV tables.
 It retains exact data and field-lineage checks rather than trusting process exit status.
