@@ -236,6 +236,45 @@ real Kafka/Paimon connectors, remote transport delivery or SQL Gateway deploymen
 
 ### SQL Client distribution acceptance
 
+#### Verified compatibility and isolation repair (2026-09-07, Asia/Shanghai)
+
+The image `flink-lineage-local:repaired-20260907` was built from clean Flink
+`392397175622eb797a92164b78e4c825d2ed139e` and OpenLineage
+`6751f8e0679df6e21370f9e8807be1a9a6d7e950` checkouts. Image ID:
+`sha256:2f35de180d750a2ec8d3741dd761b5ca11801e4ef954b0f91b30f5cfcd6da9bd`.
+Adapter SHA-256:
+`1c83d37f93a513b801a8cae1776588d0018641b247cf4ffde4df3a1d33e804e9`.
+
+All ten fresh Kubernetes cases passed: direct execution, column-only metadata
+loss, legacy metadata loss, mixed sinks, mixed restore, partial-table restore,
+complex batch restore, cancellation, runtime CAST failure, and Application mode.
+The new partial-table case removes metadata only from one independent writer:
+both outputs' rows remain correct, Good retains exact table and column
+relations, and Unsupported is UNAVAILABLE in both native status maps. The job
+lineage statuses remain PARTIAL and no Unsupported table entry is fabricated.
+
+Full Collector outage was rerun on this image. Job
+`f28066fe160282a34870f831a4164ea6` reached FINISHED with exact result rows and
+zero received events; the Collector was restored to 1/1 afterwards. This proves
+execution isolation, not guaranteed lineage delivery.
+
+Regression evidence includes 237 planner tests, 42 runtime/streaming tests,
+61 Flink 2 integration tests plus 5 shared tracker tests, 4 Python compiled-plan
+tests, and 4 event-verifier tests. The 28 updated plan snapshots were structurally
+compared with their previous versions: only optional lineage blocks changed.
+Eight graph fixtures now check full table and column JSON rather than replacing
+the graph with statuses. The fresh full
+[Flink CI run](https://github.com/Xuxiaotuan/flink/actions/runs/34078937122)
+is separate from these local checks.
+
+Local raw evidence is retained under `build/repaired-poc-20260907/`: clean build
+provenance, all 14 distribution-library hashes, image metadata, manifests,
+ten actual JobIDs and remote states, exact CSV/HTTP verification, outage
+endpoints/events, and SQL/JobManager logs. Previous `lineage-*` resources were not
+modified; completed owned session resources were scaled down with their PVCs
+retained. These checks do not establish arbitrary SQL/connector support, HA,
+savepoint compatibility, Marquez consumption, or production readiness.
+
 #### Verified independent-observation revision (2026-09-07, Asia/Shanghai)
 
 The fresh local Kubernetes image `flink-lineage-local:isolated-20260907` was built
