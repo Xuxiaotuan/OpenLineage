@@ -44,9 +44,10 @@ metadata completeness:
 | `tableStatus` | `COMPLETE`, `PARTIAL`, `UNAVAILABLE` | Verified logical table dependencies, only known runtime tables, or unavailable table metadata |
 | `columnStatus` | `COMPLETE`, `PARTIAL`, `UNAVAILABLE` | All, some, or none of the output datasets have validated complete column lineage |
 | `columnStatuses` | Namespace to dataset-name to status map | Per-output-dataset `COMPLETE` or `UNAVAILABLE`; multiple writers are judged together |
+| `tableStatuses` | Namespace to dataset-name to status map | Independent logical table coverage for each output; all its writers must be verified |
 | `issues` | Array of strings | Reasons for incomplete or unavailable metadata |
 
-`columnStatuses` uses native Flink dataset namespace/name keys so submission and
+`columnStatuses` and `tableStatuses` use native Flink dataset namespace/name keys so submission and
 JobManager snapshots remain consistent. Dataset visitors may rename the standard
 OpenLineage `outputs` identifiers; do not assume those renamed identifiers are the
 keys of this native diagnostic map.
@@ -56,7 +57,9 @@ dependencies, not inferred from column completeness or runtime topology alone.
 Thus `tableStatus=COMPLETE` with `columnStatus=UNAVAILABLE` still publishes precise
 table pairs. If independent table evidence is missing too, START/COMPLETE can
 carry `tableStatus=PARTIAL`, `columnStatus=UNAVAILABLE` and diagnostic issues;
-known table inventories remain, but the precise table-pair facet is omitted.
+known table inventories remain. Precise table pairs are emitted only for outputs
+whose `tableStatuses` entry is `COMPLETE`, even if the overall status is `PARTIAL`.
+If no output has independent complete table evidence, the precise facet is omitted.
 If even table capture or OpenLineage
 conversion fails, the listener emits an unavailable observation without dataset
 claims. `COMPLETE` in an event's type describes job execution; it does not upgrade
@@ -86,7 +89,7 @@ this isolation does not promise recovery from fatal JVM/resource failures.
 
 ### Exact table pairs in emitted events
 
-For observations with `tableStatus=COMPLETE`, the Flink 2 converter emits
+For independently complete outputs, the Flink 2 converter emits
 `job.facets.lineage.entries` from `LineageGraph.relations()`. Each output dataset
 lists only its actual logical input datasets: independent StatementSet branches
 `A -> X` and `B -> Y` do not
@@ -95,6 +98,9 @@ same output are merged by namespace and name. A verified source-free sink has an
 entry with an empty input list; incomplete observations never infer source-free
 semantics from missing edges. Dataset identifier visitors and namespace resolution
 are shared with the event's input/output datasets.
+If complete and incomplete native outputs resolve to the same OpenLineage
+identifier, the shared resolved output is excluded from exact table claims.
+This prevents identifier aliases from hiding an incomplete writer.
 
 The existing top-level `inputs` and `outputs` remain available for compatibility.
 Consumers must read the lineage facet to preserve precise table pairs; support

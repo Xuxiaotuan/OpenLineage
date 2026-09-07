@@ -16,6 +16,25 @@ import org.junit.jupiter.api.Test;
 
 class FlinkLineageFacetTest {
   @Test
+  void terminalSnapshotRetainsPerOutputTableCoverage() {
+    FlinkLineageFacet facet =
+        FlinkLineageFacet.fromStatus(
+            Map.of(
+                "internal.lineage.table-status",
+                "PARTIAL",
+                "internal.lineage.table-statuses",
+                "{\"ns\":{\"good\":\"COMPLETE\",\"shared\":\"UNAVAILABLE\"}}"));
+    assertThat(
+            io.openlineage.client.OpenLineageClientUtils.newObjectMapper()
+                .valueToTree(facet)
+                .path("tableStatuses")
+                .path("ns")
+                .path("good")
+                .asText())
+        .isEqualTo("COMPLETE");
+  }
+
+  @Test
   void columnStatusSnapshotCannotBeChangedThroughInputOrGetter() {
     Map<String, String> sinks = new LinkedHashMap<>(Map.of("sink", "COMPLETE"));
     Map<String, Map<String, String>> input = new LinkedHashMap<>(Map.of("ns", sinks));

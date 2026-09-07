@@ -148,6 +148,8 @@ class OpenLineageJobStatusChangedListenerTest {
                 "COMPLETE",
                 DefaultJobExecutionStatusEvent.LINEAGE_COLUMN_STATUS,
                 "PARTIAL",
+                DefaultJobExecutionStatusEvent.LINEAGE_TABLE_STATUSES,
+                "{\"warehouse\":{\"good\":\"COMPLETE\",\"bad\":\"UNAVAILABLE\"}}",
                 "internal.lineage.column-statuses",
                 "{\"warehouse\":{\"good\":\"COMPLETE\",\"bad\":\"UNAVAILABLE\"}}")));
     RunEvent event =
@@ -160,6 +162,7 @@ class OpenLineageJobStatusChangedListenerTest {
             .path("facets")
             .path("flink_lineage");
     assertThat(status.path("columnStatus").asText()).isEqualTo("PARTIAL");
+    assertThat(status.path("tableStatuses")).isEqualTo(status.path("columnStatuses"));
     assertThat(status.path("columnStatuses"))
         .isEqualTo(
             OpenLineageClientUtils.newObjectMapper()

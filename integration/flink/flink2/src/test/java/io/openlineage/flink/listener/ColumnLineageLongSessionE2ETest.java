@@ -182,6 +182,10 @@ public class ColumnLineageLongSessionE2ETest {
       JsonNode status = MAPPER.valueToTree(event).path("run").path("facets").path("flink_lineage");
       assertThat(status.path("columnStatus").asText()).isEqualTo("UNAVAILABLE");
       assertThat(status.path("tableStatus").asText()).isEqualTo("COMPLETE");
+      assertThat(status.path("tableStatuses"))
+          .isEqualTo(
+              MAPPER.readTree(
+                  "{\"values://AppendingSinkFunction\":{\"`lineage_catalog`.`commerce`.`OrderDetail`\":\"COMPLETE\"},\"values://RetractingSinkFunction\":{\"`lineage_catalog`.`commerce`.`TierSummary`\":\"COMPLETE\"}}"));
       assertThat(status.path("issues").size()).isGreaterThan(0);
       if (event.getEventType() == EventType.START) {
         assertThat(event.getOutputs()).hasSize(2);

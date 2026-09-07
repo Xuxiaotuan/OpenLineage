@@ -80,9 +80,9 @@ module.exports.terminal = function verifyTerminal(root, expectedType) {
   assert.deepEqual(initial.issues, []);
   assert.deepEqual(terminal[0].run.facets.flink_lineage, initial, 'Terminal status preserves lineage availability');
 };
-module.exports.mixed = function verifyMixed(root) {
+module.exports.mixed = function verifyMixed(root, partialTable = false) {
   assert.deepEqual(rows(path.join(root, 'good')), ['2', '3', '4']);
-  assert.deepEqual(rows(path.join(root, 'unsupported')), ['2', '3']);
+  assert.deepEqual(rows(path.join(root, 'unsupported')), partialTable ? ['3', '4', '5'] : ['2', '3']);
   const events = fs.readFileSync(path.join(root, 'events.jsonl'), 'utf8').trim().split(/\r?\n/).map(JSON.parse);
   const starts = events.filter(e => e.eventType === 'START');
   const terminal = events.filter(e => ['COMPLETE', 'ABORT', 'FAIL'].includes(e.eventType));
@@ -94,20 +94,29 @@ module.exports.mixed = function verifyMixed(root) {
   const name = table => '`default_catalog`.`lineage_acceptance`.`' + table + '`';
   for (const event of [starts[0], terminal[0]]) {
     const status = event.run.facets.flink_lineage;
-    assert.equal(status.tableStatus, 'COMPLETE');
+    assert.equal(status.tableStatus, partialTable ? 'PARTIAL' : 'COMPLETE');
     assert.equal(status.columnStatus, 'PARTIAL');
     assert.ok(status.issues.length > 0);
     assert.deepEqual(status.columnStatuses, {[namespace]: {
       [name('Good')]: 'COMPLETE', [name('Unsupported')]: 'UNAVAILABLE'
     }});
+    if (partialTable) assert.deepEqual(status.tableStatuses, {[namespace]: {
+      [name('Good')]: 'COMPLETE', [name('Unsupported')]: 'UNAVAILABLE'
+    }});
   }
   const start = starts[0];
+  assert.deepEqual(terminal[0].run.facets.flink_lineage, start.run.facets.flink_lineage,
+    'Terminal status preserves all per-sink availability');
   assert.deepEqual(start.inputs.map(i => i.name).sort(), [name('Numbers'), name('OtherNumbers')]);
   assert.deepEqual(start.outputs.map(o => o.name).sort(), [name('Good'), name('Unsupported')]);
   for (const dataset of [...start.inputs, ...start.outputs]) assert.equal(dataset.namespace, namespace);
   const pairs = start.job.facets.lineage.entries.flatMap(o => o.inputs.map(i => i.name + ' -> ' + o.name));
-  assert.deepEqual(pairs.sort(), [name('Numbers') + ' -> ' + name('Good'),
-    name('Numbers') + ' -> ' + name('Unsupported'), name('OtherNumbers') + ' -> ' + name('Unsupported')].sort());
+  const expectedPairs = [name('Numbers') + ' -> ' + name('Good')];
+  if (!partialTable) expectedPairs.push(name('Numbers') + ' -> ' + name('Unsupported'),
+    name('OtherNumbers') + ' -> ' + name('Unsupported'));
+  assert.deepEqual(pairs.sort(), expectedPairs.sort(), 'Only verified exact table pairs');
+  assert.deepEqual(start.job.facets.lineage.entries.map(o => o.name).sort(),
+    (partialTable ? ['Good'] : ['Good', 'Unsupported']).map(name), 'Only verified output entries');
   const good = start.outputs.find(o => o.name === name('Good'));
   const unsupported = start.outputs.find(o => o.name === name('Unsupported'));
   assert.ok(!unsupported.facets?.columnLineage, 'Unsupported sink must not have a column facet');

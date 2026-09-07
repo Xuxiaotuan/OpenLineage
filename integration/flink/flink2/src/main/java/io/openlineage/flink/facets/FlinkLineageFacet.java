@@ -31,6 +31,11 @@ public class FlinkLineageFacet extends OpenLineage.DefaultRunFacet {
    */
   private final Map<String, Map<String, String>> columnStatuses;
 
+  /**
+   * Table coverage keyed by native Flink dataset namespace and name, before identifier visitors.
+   */
+  private final Map<String, Map<String, String>> tableStatuses;
+
   public FlinkLineageFacet(String tableStatus, String columnStatus, List<String> issues) {
     this(tableStatus, columnStatus, issues, Collections.emptyMap());
   }
@@ -40,6 +45,15 @@ public class FlinkLineageFacet extends OpenLineage.DefaultRunFacet {
       String columnStatus,
       List<String> issues,
       Map<String, Map<String, String>> columnStatuses) {
+    this(tableStatus, columnStatus, issues, columnStatuses, Collections.emptyMap());
+  }
+
+  public FlinkLineageFacet(
+      String tableStatus,
+      String columnStatus,
+      List<String> issues,
+      Map<String, Map<String, String>> columnStatuses,
+      Map<String, Map<String, String>> tableStatuses) {
     super(Versions.OPEN_LINEAGE_PRODUCER_URI);
     this.tableStatus = tableStatus;
     this.columnStatus = columnStatus;
@@ -49,6 +63,11 @@ public class FlinkLineageFacet extends OpenLineage.DefaultRunFacet {
         (namespace, statuses) ->
             copy.put(namespace, Collections.unmodifiableMap(new LinkedHashMap<>(statuses))));
     this.columnStatuses = Collections.unmodifiableMap(copy);
+    Map<String, Map<String, String>> tableCopy = new LinkedHashMap<>();
+    tableStatuses.forEach(
+        (namespace, statuses) ->
+            tableCopy.put(namespace, Collections.unmodifiableMap(new LinkedHashMap<>(statuses))));
+    this.tableStatuses = Collections.unmodifiableMap(tableCopy);
   }
 
   public static FlinkLineageFacet fromStatus(Map<String, String> status) {
@@ -79,11 +98,25 @@ public class FlinkLineageFacet extends OpenLineage.DefaultRunFacet {
       columnStatus = "UNAVAILABLE";
       issues.add("Invalid column status snapshot: " + failure.getMessage());
     }
-    return new FlinkLineageFacet(
-        status.getOrDefault(DefaultJobExecutionStatusEvent.LINEAGE_TABLE_STATUS, "UNAVAILABLE"),
-        columnStatus,
-        issues,
-        columnStatuses);
+    String tableStatus =
+        status.getOrDefault(DefaultJobExecutionStatusEvent.LINEAGE_TABLE_STATUS, "UNAVAILABLE");
+    Map<String, Map<String, String>> tableStatuses = Collections.emptyMap();
+    try {
+      tableStatuses =
+          OpenLineageClientUtils.newObjectMapper()
+              .readValue(
+                  status.getOrDefault(DefaultJobExecutionStatusEvent.LINEAGE_TABLE_STATUSES, "{}"),
+                  new TypeReference<Map<String, Map<String, String>>>() {});
+      if (tableStatuses == null
+          || tableStatuses.values().stream().anyMatch(java.util.Objects::isNull)) {
+        throw new IllegalArgumentException("Table status snapshot must contain namespace maps");
+      }
+    } catch (Exception failure) {
+      tableStatuses = Collections.emptyMap();
+      tableStatus = "UNAVAILABLE";
+      issues.add("Invalid table status snapshot: " + failure.getMessage());
+    }
+    return new FlinkLineageFacet(tableStatus, columnStatus, issues, columnStatuses, tableStatuses);
   }
 
   public static FlinkLineageFacet fromGraph(LineageGraph graph) {
@@ -93,7 +126,8 @@ public class FlinkLineageFacet extends OpenLineage.DefaultRunFacet {
           observation.getTableStatus(),
           observation.getColumnStatus(),
           observation.getIssues(),
-          observation.getColumnStatuses());
+          observation.getColumnStatuses(),
+          observation.getTableStatuses());
     }
     return new FlinkLineageFacet(
         "UNAVAILABLE",

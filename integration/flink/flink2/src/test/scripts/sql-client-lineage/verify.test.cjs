@@ -51,6 +51,20 @@ test('mixed sink acceptance retains only supported columns and rejects false com
   events[0].outputs[1].facets.columnLineage = {fields:{}};
   save();
   assert.throws(() => verify.mixed(root), /Unsupported sink/);
+  delete events[0].outputs[1].facets.columnLineage;
+  fs.writeFileSync(path.join(root, 'unsupported', 'part-0'), '3\n4\n5\n');
+  status.tableStatus = 'PARTIAL';
+  status.tableStatuses = {[namespace]: {[name('Good')]: 'COMPLETE', [name('Unsupported')]: 'UNAVAILABLE'}};
+  events[0].job.facets.lineage.entries.pop();
+  save();
+  assert.doesNotThrow(() => verify.mixed(root, true));
+  events[0].job.facets.lineage.entries.push({namespace, name: name('Unsupported'),
+    inputs: [{namespace, name: name('OtherNumbers')}]});
+  save();
+  assert.throws(() => verify.mixed(root, true), /exact table pairs/);
+  events[0].job.facets.lineage.entries.at(-1).inputs = [];
+  save();
+  assert.throws(() => verify.mixed(root, true), /verified output entries/);
 });
 
 test('complete acceptance preserves direct and indirect roles on the same input field', () => {

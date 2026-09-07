@@ -87,12 +87,15 @@ assert.deepEqual(verify(restored.dir), directFields, 'Direct and restored field 
 console.log('PASS: disk plan restored in a fresh SQL Client process without original views/tables');
 const mixedTemplate = fs.readFileSync(path.join(__dirname, 'mixed.sql'), 'utf8');
 let mixedFields;
-for (const mode of ['mixed', 'mixed-restored']) {
+for (const mode of ['mixed', 'mixed-restored', 'partial-table']) {
   const dir = path.join(root, mode);
   fs.mkdirSync(dir);
   fs.writeFileSync(path.join(dir, 'numbers.csv'), '1\n2\n3\n');
   fs.writeFileSync(path.join(dir, 'other-numbers.csv'), '2\n3\n4\n');
-  const sql = mixedTemplate.replaceAll('__ROOT__', dir.replaceAll("'", "''"));
+  let sql = mixedTemplate.replaceAll('__ROOT__', dir.replaceAll("'", "''"));
+  if (mode === 'partial-table') sql = sql.replace(
+    'INSERT INTO Unsupported SELECT `value` FROM Numbers INTERSECT SELECT `value` FROM OtherNumbers;',
+    'INSERT INTO Unsupported SELECT `value` + 1 FROM OtherNumbers;');
   if (mode === 'mixed') {
     run(dir, 'execute', sql);
     mixedFields = verify.mixed(dir);
@@ -100,9 +103,20 @@ for (const mode of ['mixed', 'mixed-restored']) {
     const mixedPlan = path.join(dir, 'plan.json');
     run(dir, 'compile', sql.replace('EXECUTE STATEMENT SET', "COMPILE PLAN '" + mixedPlan + "' FOR STATEMENT SET"));
     assert.ok(!fs.existsSync(path.join(dir, 'events.jsonl')), 'Mixed compilation must not submit');
+    if (mode === 'partial-table') {
+      const plan = JSON.parse(fs.readFileSync(mixedPlan, 'utf8'));
+      const sink = plan.nodes.map(node => node.dynamicTableSink).find(sink =>
+        sink?.tableLineage?.sinkKey === '`default_catalog`.`lineage_acceptance`.`Unsupported`');
+      assert.ok(sink?.columnLineage && sink?.tableLineage, 'Both independent sink metadata blocks exist before removal');
+      delete sink.columnLineage;
+      delete sink.tableLineage;
+      fs.writeFileSync(path.join(dir, 'original-plan.json'), fs.readFileSync(mixedPlan));
+      fs.writeFileSync(mixedPlan, JSON.stringify(plan));
+    }
     run(dir, 'restore', sql.split('CREATE DATABASE')[0] + "EXECUTE PLAN '" + mixedPlan + "';\n");
-    assert.deepEqual(verify.mixed(dir), mixedFields, 'Mixed sink lineage survives compiled restore');
+    if (mode === 'partial-table') verify.mixed(dir, true);
+    else assert.deepEqual(verify.mixed(dir), mixedFields, 'Mixed sink lineage survives compiled restore');
   }
-  console.log('PASS: ' + mode + ' exact data, complete table lineage and per-sink column availability');
+  console.log('PASS: ' + mode + ' exact data and per-sink table/column availability');
 }
 console.log('ALL SQL CLIENT ACCEPTANCE CHECKS PASSED: ' + root);

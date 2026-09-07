@@ -61,8 +61,22 @@ class OpenLineageDatasetExtractor {
     OpenLineage ol = context.getOpenLineage();
     Map<List<String>, Map<List<String>, OpenLineage.LineageInput>> inputsByOutput =
         new LinkedHashMap<>();
+    java.util.Set<List<String>> incompleteOutputs = new java.util.HashSet<>();
     for (LineageVertex vertex : graph.sinks()) {
       for (LineageDataset sink : vertex.datasets()) {
+        if (!hasCompleteTableLineage(graph, sink)) {
+          for (LineageDatasetWithIdentifier output : extractDatasetsWithIdentifiers(sink)) {
+            DatasetIdentifier id = output.getDatasetIdentifier();
+            incompleteOutputs.add(List.of(id.getNamespace(), id.getName()));
+          }
+        }
+      }
+    }
+    for (LineageVertex vertex : graph.sinks()) {
+      for (LineageDataset sink : vertex.datasets()) {
+        if (!hasCompleteTableLineage(graph, sink)) {
+          continue;
+        }
         Collection<LineageDatasetWithIdentifier> outputs = extractDatasetsWithIdentifiers(sink);
         if (outputs.isEmpty()) {
           throw new IllegalStateException(
@@ -70,6 +84,9 @@ class OpenLineageDatasetExtractor {
         }
         for (LineageDatasetWithIdentifier output : outputs) {
           DatasetIdentifier target = output.getDatasetIdentifier();
+          if (incompleteOutputs.contains(List.of(target.getNamespace(), target.getName()))) {
+            continue;
+          }
           inputsByOutput.putIfAbsent(
               List.of(target.getNamespace(), target.getName()), new LinkedHashMap<>());
         }
@@ -77,6 +94,9 @@ class OpenLineageDatasetExtractor {
     }
     for (LineageEdge edge : graph.relations()) {
       for (LineageDataset sink : edge.sink().datasets()) {
+        if (!hasCompleteTableLineage(graph, sink)) {
+          continue;
+        }
         Collection<LineageDatasetWithIdentifier> outputs = extractDatasetsWithIdentifiers(sink);
         if (outputs.isEmpty()) {
           throw new IllegalStateException(
@@ -84,6 +104,9 @@ class OpenLineageDatasetExtractor {
         }
         for (LineageDatasetWithIdentifier output : outputs) {
           DatasetIdentifier target = output.getDatasetIdentifier();
+          if (incompleteOutputs.contains(List.of(target.getNamespace(), target.getName()))) {
+            continue;
+          }
           Map<List<String>, OpenLineage.LineageInput> inputs =
               inputsByOutput.computeIfAbsent(
                   List.of(target.getNamespace(), target.getName()),
@@ -122,6 +145,24 @@ class OpenLineageDatasetExtractor {
     return entries.isEmpty()
         ? Optional.empty()
         : Optional.of(ol.newLineageJobFacetBuilder().entries(entries).build());
+  }
+
+  private boolean hasCompleteTableLineage(LineageGraph graph, LineageDataset sink) {
+    if (!(graph instanceof org.apache.flink.streaming.api.lineage.LineageGraphObservation)) {
+      return true;
+    }
+    org.apache.flink.streaming.api.lineage.LineageGraphObservation observation =
+        (org.apache.flink.streaming.api.lineage.LineageGraphObservation) graph;
+    if (observation.getTableStatuses().isEmpty()) {
+      return "COMPLETE".equals(observation.getTableStatus());
+    }
+    return !"UNAVAILABLE".equals(observation.getTableStatus())
+        && "COMPLETE"
+            .equals(
+                observation
+                    .getTableStatuses()
+                    .getOrDefault(sink.namespace(), Collections.emptyMap())
+                    .get(sink.name()));
   }
 
   List<InputDataset> extractInputs(LineageGraph graph) {

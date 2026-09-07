@@ -98,6 +98,44 @@ class LineageGraphConverterTest {
   }
 
   @Test
+  void incompleteNativeAliasSuppressesOnlyItsResolvedOutputPairs() {
+    LineageDataset good = lineageDatasetOf("good", "native").getFlinkDataset();
+    LineageDataset bad = lineageDatasetOf("bad", "native").getFlinkDataset();
+    LineageDataset independent = lineageDatasetOf("independent", "native").getFlinkDataset();
+    when(visitorFactory.loadDatasetIdentifierVisitors(context))
+        .thenReturn(
+            List.of(
+                new MultipleDatasetIdentifierVisitor(
+                    good, List.of(new DatasetIdentifier("shared", "resolved"))),
+                new MultipleDatasetIdentifierVisitor(
+                    bad, List.of(new DatasetIdentifier("shared", "resolved")))));
+    when(graph.sinks()).thenReturn(List.of(vertexOf(good), vertexOf(bad), vertexOf(independent)));
+    LineageGraphObservation observation =
+        new LineageGraphObservation(
+            graph,
+            "PARTIAL",
+            "UNAVAILABLE",
+            List.of(),
+            Map.of(),
+            Map.of(
+                "native",
+                Map.of("good", "COMPLETE", "bad", "UNAVAILABLE", "independent", "COMPLETE")));
+    OpenLineage.Job job =
+        new OpenLineageJobExtractor(
+                context, new OpenLineageDatasetExtractor(context, visitorFactory))
+            .extract(observation);
+    assertThat(
+            OpenLineageClientUtils.newObjectMapper().valueToTree(job).at("/facets/lineage/entries"))
+        .hasSize(1);
+    assertThat(
+            OpenLineageClientUtils.newObjectMapper()
+                .valueToTree(job)
+                .at("/facets/lineage/entries/0/name")
+                .asText())
+        .isEqualTo("independent");
+  }
+
+  @Test
   void duplicateResolvedInventoriesRetainOneIdenticalDefinition() {
     for (boolean outputs : new boolean[] {false, true}) {
       configureDuplicateInventory(outputs, "BIGINT");
@@ -681,6 +719,46 @@ class LineageGraphConverterTest {
             OpenLineageClientUtils.newObjectMapper()
                 .valueToTree(
                     Map.of("ns", Map.of("supported", "COMPLETE", "unsupported", "UNAVAILABLE"))));
+  }
+
+  @Test
+  void partialTablesPublishOnlyIndependentlyCompleteOutputsIncludingProvenConstants()
+      throws Exception {
+    SourceLineageVertex source =
+        sourceVertexOf(Boundedness.BOUNDED, List.of(lineageDatasetOf("A", "ns").getFlinkDataset()));
+    LineageVertex good = vertexOf(lineageDatasetOf("good", "ns").getFlinkDataset());
+    LineageVertex shared = vertexOf(lineageDatasetOf("shared", "ns").getFlinkDataset());
+    LineageVertex constants = vertexOf(lineageDatasetOf("constants", "ns").getFlinkDataset());
+    when(graph.sources()).thenReturn(List.of(source));
+    when(graph.sinks()).thenReturn(List.of(good, shared, constants));
+    when(graph.relations()).thenReturn(List.of(edgeOf(source, good), edgeOf(source, shared)));
+    OpenLineage.RunEvent event =
+        converter.convert(
+            new LineageGraphObservation(
+                graph,
+                "PARTIAL",
+                "UNAVAILABLE",
+                List.of(),
+                Map.of(),
+                Map.of(
+                    "ns",
+                    Map.of("good", "COMPLETE", "shared", "UNAVAILABLE", "constants", "COMPLETE"))),
+            EventType.START);
+    JsonNode entries =
+        OpenLineageClientUtils.newObjectMapper()
+            .valueToTree(event)
+            .at("/job/facets/lineage/entries");
+    assertThat(entries)
+        .isEqualTo(
+            OpenLineageClientUtils.newObjectMapper()
+                .readTree(
+                    "[{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"good\",\"inputs\":[{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"A\"}]},{\"type\":\"DATASET\",\"namespace\":\"ns\",\"name\":\"constants\",\"inputs\":[]}]"));
+    assertThat(
+            OpenLineageClientUtils.newObjectMapper()
+                .valueToTree(event)
+                .at("/run/facets/flink_lineage/tableStatuses/ns/shared")
+                .asText())
+        .isEqualTo("UNAVAILABLE");
   }
 
   @Test
