@@ -76,7 +76,7 @@ claim for these new assertions or for the additional mixed/legacy fixtures.
    rows, START/COMPLETE, PARTIAL table status, UNAVAILABLE columns, known table
    inventories and no precise table-pair or column facet.
 5. **Mixed-sink direct and restored plans:** a supported projection writes
-   `2,3,4` to Good and INTERSECT writes `2,3` to Unsupported. Requires COMPLETE
+   `2,3,4` to Good and a correlated EXISTS filter writes `2,3` to Unsupported. Requires COMPLETE
    table status and three precise source/sink pairs, PARTIAL column status,
    `columnLineage` only on Good, and matching nested `columnStatuses` on START and
    COMPLETE. Direct and fresh-process compiled restore must agree exactly.

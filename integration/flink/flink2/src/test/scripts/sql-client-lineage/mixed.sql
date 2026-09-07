@@ -21,5 +21,5 @@ WITH ('connector'='filesystem', 'path'='file://__ROOT__/unsupported', 'format'='
 EXECUTE STATEMENT SET
 BEGIN
 INSERT INTO Good SELECT `value` + 1 FROM Numbers;
-INSERT INTO Unsupported SELECT `value` FROM Numbers INTERSECT SELECT `value` FROM OtherNumbers;
+INSERT INTO Unsupported SELECT n.`value` FROM Numbers n WHERE EXISTS (SELECT 1 FROM OtherNumbers r WHERE r.`value` = n.`value`);
 END;

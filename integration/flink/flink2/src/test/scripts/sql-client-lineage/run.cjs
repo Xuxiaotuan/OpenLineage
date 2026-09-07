@@ -94,7 +94,7 @@ for (const mode of ['mixed', 'mixed-restored', 'partial-table']) {
   fs.writeFileSync(path.join(dir, 'other-numbers.csv'), '2\n3\n4\n');
   let sql = mixedTemplate.replaceAll('__ROOT__', dir.replaceAll("'", "''"));
   if (mode === 'partial-table') sql = sql.replace(
-    'INSERT INTO Unsupported SELECT `value` FROM Numbers INTERSECT SELECT `value` FROM OtherNumbers;',
+    'INSERT INTO Unsupported SELECT n.`value` FROM Numbers n WHERE EXISTS (SELECT 1 FROM OtherNumbers r WHERE r.`value` = n.`value`);',
     'INSERT INTO Unsupported SELECT `value` + 1 FROM OtherNumbers;');
   if (mode === 'mixed') {
     run(dir, 'execute', sql);

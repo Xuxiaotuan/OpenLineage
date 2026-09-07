@@ -191,12 +191,22 @@ not a claim to support every Flink SQL feature.
 | Scalar UDF calls | Tracks supplied argument dependencies, not UDF internals or external reads |
 | Filters, ordinary two-sided joins, grouping and aggregates | Supported; predicates and grouping retain indirect roles |
 | OVER/Window, Union, sort/limit, Values | Supported for handled logical node and expression shapes |
+| INTERSECT / EXCEPT, DISTINCT and ALL | Whole-row membership is indirect; INTERSECT merges positional value origins, EXCEPT returns values only from the first input |
+| SEMI / ANTI relational Join nodes | Only left value fields are returned; join predicates and both inputs' row filters remain indirect dependencies |
 | Views and nonrecursive CTEs | Expanded to underlying source-to-sink dependencies |
 | Watermark assignment | Passes through column values without adding watermark-expression dependencies |
 | Field selection from an explicit `ROW(a, b)` constructor | Tracks the selected component exactly through projections |
 | Nested source ROW fields or black-box ROW result members | Explicitly unsupported; no top-level approximation is called precise nested lineage |
 | RexSubQuery, correlated references, Correlate/UDTF/TableFunctionScan, Match | Explicitly unsupported |
-| Intersect/Minus, recursive RepeatUnion/TableSpool, SEMI/ANTI joins | Unsupported by the current extraction path |
+| Recursive RepeatUnion/TableSpool | Unsupported by the current extraction path |
+
+SEMI/ANTI node support does not establish support for SQL `IN`, `NOT IN`, or
+`EXISTS`: the capture point precedes subquery rewriting, and `RexSubQuery` and
+correlated expressions are still rejected. Membership set operations use the
+existing FILTER transformation with exact DIRECT/INDIRECT field roles; they do
+not change Flink's execution plan or add a serialized transformation enum value.
+The mixed-sink negative fixture now uses correlated EXISTS instead of INTERSECT,
+so it continues testing unavailable columns alongside independently valid outputs.
 
 Member access after operations that do not preserve explicit ROW component
 metadata remains unsupported. Unsupported extraction invalidates the affected
@@ -255,6 +265,48 @@ for nested ROW field access, arbitrary UDF internals, external UDF Jar loading,
 real Kafka/Paimon connectors, remote transport delivery or SQL Gateway deployment.
 
 ### SQL Client distribution acceptance
+
+#### Set operations and real PostgreSQL POC (2026-09-07, Asia/Shanghai)
+
+The opt-in [JDBC acceptance script](flink2/src/test/scripts/jdbc-lineage/README.md)
+uses a real isolated PostgreSQL container, deliberately different logical aliases
+and physical table names, and one six-sink StatementSet. It checks JOIN, filters,
+aggregation, INTERSECT / EXCEPT with DISTINCT and ALL, duplicates and NULLs.
+Its assertions require four physical inputs, six outputs, twelve exact table
+edges and fourteen output fields with exact DIRECT/INDIRECT references, plus
+literal expected database rows. The same checks run after a fresh-process saved
+plan restore without the original DDL. START carries the graph; COMPLETE carries
+the correlated runtime status snapshot, not a repeated graph payload.
+
+These changes are local worktree changes based on Flink `c895962138fb` and
+OpenLineage `f2a0a5be688b`; those commits alone do not identify the new build.
+The focused Flink batch/stream extraction and propagation suites passed 117 tests,
+including a red/green guard against incorrectly retaining left-only ROW member
+metadata after INTERSECT. This does not establish general SQL subquery support.
+
+The final rebuilt distribution passed both direct PostgreSQL execution and
+fresh-process plan restore, including the strengthened duplicate-multiplicity
+fixture. Local raw evidence is retained at
+`/var/folders/c0/wzxnynsn36vf746bn4vcx_9r0000gn/T/ol-jdbc-P667xF/`.
+Build provenance (explicitly marked dirty), distribution library hashes and the
+acceptance log are under `integration/flink/build/jdbc-poc-20260907/` from the
+repository root. The paired adapter passed 105 tests, Spotless and the distribution
+Jar verifier. PostgreSQL is the dedicated `lineage-jdbc-poc-20260907` container,
+published only at `127.0.0.1:32768`; generated schemas and evidence are retained.
+The same final distribution also passed all seven SQL Client positive/negative
+acceptance cases, including independent metadata loss and mixed-sink restores;
+raw evidence is at
+`/var/folders/c0/wzxnynsn36vf746bn4vcx_9r0000gn/T/ol-cli-4PfKag/`.
+
+No new Kubernetes image or Operator rollout is part of this POC. The existing
+Operator `prepare-cases.cjs` partial-table fixture still replaces the old
+INTERSECT SQL literal and needs synchronization with the new correlated-EXISTS
+negative fixture before reusing that Kubernetes matrix. Historical Kubernetes
+results below are not evidence for this new worktree.
+The prior-commit remote CI run `34096566618` failed in
+`SqlGatewayServiceITCase.testReleaseLockWhenFailedToSubmitOperation` with
+`RejectedExecutionException` on a saturated executor. That separate test failure
+has not been fixed here; these focused POC passes do not claim full CI is green.
 
 #### Latest submission-identity acceptance (2026-09-07, Asia/Shanghai)
 
