@@ -197,15 +197,16 @@ not a claim to support every Flink SQL feature.
 | Watermark assignment | Passes through column values without adding watermark-expression dependencies |
 | Field selection from an explicit `ROW(a, b)` constructor | Tracks the selected component exactly through projections |
 | Nested source ROW fields or black-box ROW result members | Explicitly unsupported; no top-level approximation is called precise nested lineage |
-| RexSubQuery, correlated references, Correlate/UDTF/TableFunctionScan, Match | Explicitly unsupported |
+| IN / NOT IN / EXISTS / NOT EXISTS expressions | Exact value/control dependencies for the tested projection, WHERE, correlation and JOIN ON shapes; see the current revision notes below |
+| Scalar subqueries, Correlate/UDTF/TableFunctionScan, Match | Explicitly unsupported |
 | Recursive RepeatUnion/TableSpool | Unsupported by the current extraction path |
 
-SEMI/ANTI node support does not establish support for SQL `IN`, `NOT IN`, or
-`EXISTS`: the capture point precedes subquery rewriting, and `RexSubQuery` and
-correlated expressions are still rejected. Membership set operations use the
+SEMI/ANTI node support alone does not establish support for SQL subqueries:
+the capture point precedes subquery rewriting, so membership expressions and
+their correlation scopes require separate extraction and tests. Membership set operations use the
 existing FILTER transformation with exact DIRECT/INDIRECT field roles; they do
 not change Flink's execution plan or add a serialized transformation enum value.
-The mixed-sink negative fixture now uses correlated EXISTS instead of INTERSECT,
+The mixed-sink negative fixture now uses a scalar MIN subquery instead of EXISTS,
 so it continues testing unavailable columns alongside independently valid outputs.
 
 Member access after operations that do not preserve explicit ROW component
@@ -266,6 +267,63 @@ real Kafka/Paimon connectors, remote transport delivery or SQL Gateway deploymen
 
 ### SQL Client distribution acceptance
 
+#### Membership subquery revision (2026-09-07, Asia/Shanghai)
+
+The paired Planner suites passed 139 tests: 49 batch, 49 streaming and 41
+propagation/recovery tests. The extractor handles declared correlation scopes
+and tested JOIN ON correlations against the combined left/right row, preserving
+already bound ancestors. It does not infer ownership from matching field types.
+Deeply nested JOIN scopes that cannot be resolved are explicitly rejected by
+column extraction; the observer isolates that failure rather than changing the
+Flink execution plan. This does not claim arbitrary nested ON support. Two
+ambiguous nested examples are also rejected by Flink's own SQL explain path;
+other deeper combinations may conservatively lose column lineage and remain
+outside this verified coverage.
+
+The current worktree adds exact membership checks to the JDBC acceptance:
+four physical inputs, ten outputs, twenty table edges and twenty-two output
+fields. IN and EXISTS preserve matching left duplicates; the right-side NULL
+makes NOT IN empty, while NOT EXISTS retains the unmatched and NULL left rows.
+An unused EXISTS SELECT expression must not become a field dependency.
+Both direct execution and fresh-process compiled-plan restore passed the same
+literal row and field-role assertions using the final rebuilt distribution.
+Raw PostgreSQL evidence is retained at
+`/var/folders/c0/wzxnynsn36vf746bn4vcx_9r0000gn/T/ol-jdbc-4Bky1M/`.
+The paired adapter passed 105 tests, Spotless and the Jar verifier.
+All seven SQL Client distribution cases also passed, including missing metadata,
+mixed sinks and their independent-process restores. Raw evidence is at
+`/var/folders/c0/wzxnynsn36vf746bn4vcx_9r0000gn/T/ol-cli-NJMKMJ/`.
+
+The Operator fixture generator now replaces the uniquely named Unsupported
+writer and rejects missing or duplicate writers. Its positive SQL also exercises
+the four membership predicates. The new image
+`flink-lineage-local:subquery-20260907` passed ten real Kubernetes cases on
+isolated `subquery-*` resources: direct, incomplete metadata, legacy metadata,
+mixed sinks, mixed restore, partial-table restore, complex restore, cancellation,
+runtime failure and Application. Each check correlates actual remote JobID,
+expected terminal state, received HTTP events and applicable literal data/field
+assertions. The first direct-case harness wait expired after 60 seconds while
+the job was progressing; bounded polling then verified that same JobID without
+resubmission. Both logs remain available. This is not a performance result.
+The completed new Session Deployment was scaled to zero to fit Application;
+its evidence PVC is retained, and pre-existing resources were not changed.
+No collector-outage rerun, HA or reliable-delivery claim is included.
+
+The Planner change is committed as Flink `3f3590df8c1`. The tested artifacts were
+built immediately before that commit, from `f56bb1c0120` plus the recorded source
+diff; provenance correctly records a dirty build, not a clean base-commit build.
+The image, all distribution library hashes, source diffs, manifests and runtime
+evidence are retained under `integration/flink/build/subquery-poc-20260907/`.
+
+The independent SQL Gateway executor-recovery test race was fixed separately in
+Flink `f56bb1c01200ea04866618583288c21ec7612447`. Its focused test and all 33 tests
+in the class passed locally. The push-triggered
+[CI run](https://github.com/Xuxiaotuan/flink/actions/runs/34107566540)
+passed basic QA and compilation before being superseded and cancelled by the
+subsequent Planner push. The
+[final-revision run](https://github.com/Xuxiaotuan/flink/actions/runs/34109274497)
+is still running; this is not a full-CI success claim.
+
 #### Set operations and real PostgreSQL POC (2026-09-07, Asia/Shanghai)
 
 The opt-in [JDBC acceptance script](flink2/src/test/scripts/jdbc-lineage/README.md)
@@ -298,15 +356,15 @@ acceptance cases, including independent metadata loss and mixed-sink restores;
 raw evidence is at
 `/var/folders/c0/wzxnynsn36vf746bn4vcx_9r0000gn/T/ol-cli-4PfKag/`.
 
-No new Kubernetes image or Operator rollout is part of this POC. The existing
-Operator `prepare-cases.cjs` partial-table fixture still replaces the old
-INTERSECT SQL literal and needs synchronization with the new correlated-EXISTS
-negative fixture before reusing that Kubernetes matrix. Historical Kubernetes
+At the time of this set-operation acceptance, no new Kubernetes image or Operator
+rollout was included. The then-existing Operator `prepare-cases.cjs` partial-table
+fixture replaced the old INTERSECT SQL literal and still needed synchronization
+with the correlated-EXISTS negative fixture. Historical Kubernetes
 results below are not evidence for this new worktree.
 The prior-commit remote CI run `34096566618` failed in
 `SqlGatewayServiceITCase.testReleaseLockWhenFailedToSubmitOperation` with
 `RejectedExecutionException` on a saturated executor. That separate test failure
-has not been fixed here; these focused POC passes do not claim full CI is green.
+was not fixed by that set-operation revision; these focused POC passes do not claim full CI is green.
 
 #### Latest submission-identity acceptance (2026-09-07, Asia/Shanghai)
 

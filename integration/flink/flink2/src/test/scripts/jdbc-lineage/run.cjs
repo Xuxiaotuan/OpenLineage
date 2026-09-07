@@ -31,6 +31,10 @@ CREATE TABLE ${schema}.intersection (v BIGINT, tag TEXT);
 CREATE TABLE ${schema}.intersection_all (v BIGINT, tag TEXT);
 CREATE TABLE ${schema}.difference (v BIGINT, tag TEXT);
 CREATE TABLE ${schema}.difference_all (v BIGINT, tag TEXT);
+CREATE TABLE ${schema}.in_sink (v BIGINT, tag TEXT);
+CREATE TABLE ${schema}.not_in_sink (v BIGINT, tag TEXT);
+CREATE TABLE ${schema}.exists_sink (v BIGINT, tag TEXT);
+CREATE TABLE ${schema}.not_exists_sink (v BIGINT, tag TEXT);
 INSERT INTO ${schema}.orders VALUES (1,10,100,5),(2,20,200,5),(3,10,50,5);
 INSERT INTO ${schema}.customers VALUES (10,'gold'),(20,'blocked');
 INSERT INTO ${schema}.set_left VALUES (1,'a'),(1,'a'),(1,'a'),(2,'b'),(NULL,'z'),(3,'c');
@@ -65,6 +69,10 @@ const ddl = table('LogicalOrders', 'orders', 'order_id BIGINT, customer_id BIGIN
   + table('IntersectionAllSink', 'intersection_all', 'v BIGINT, tag STRING')
   + table('DifferenceSink', 'difference', 'v BIGINT, tag STRING')
   + table('DifferenceAllSink', 'difference_all', 'v BIGINT, tag STRING')
+  + table('InSink', 'in_sink', 'v BIGINT, tag STRING')
+  + table('NotInSink', 'not_in_sink', 'v BIGINT, tag STRING')
+  + table('ExistsSink', 'exists_sink', 'v BIGINT, tag STRING')
+  + table('NotExistsSink', 'not_exists_sink', 'v BIGINT, tag STRING')
   + `CREATE TEMPORARY VIEW Enriched AS SELECT o.order_id, c.tier, o.amount + o.fee AS net_amount
 FROM LogicalOrders o JOIN LogicalCustomers c ON o.customer_id = c.customer_id WHERE c.tier <> 'blocked';\n`;
 const statements = `STATEMENT SET BEGIN
@@ -74,6 +82,10 @@ INSERT INTO IntersectionSink SELECT v, tag FROM SetLeft INTERSECT SELECT v, tag 
 INSERT INTO IntersectionAllSink SELECT v, tag FROM SetLeft INTERSECT ALL SELECT v, tag FROM SetRight;
 INSERT INTO DifferenceSink SELECT v, tag FROM SetLeft EXCEPT SELECT v, tag FROM SetRight;
 INSERT INTO DifferenceAllSink SELECT v, tag FROM SetLeft EXCEPT ALL SELECT v, tag FROM SetRight;
+INSERT INTO InSink SELECT l.v, l.tag FROM SetLeft l WHERE l.v IN (SELECT r.v FROM SetRight r);
+INSERT INTO NotInSink SELECT l.v, l.tag FROM SetLeft l WHERE l.v NOT IN (SELECT r.v FROM SetRight r);
+INSERT INTO ExistsSink SELECT l.v, l.tag FROM SetLeft l WHERE EXISTS (SELECT r.tag FROM SetRight r WHERE r.v = l.v);
+INSERT INTO NotExistsSink SELECT l.v, l.tag FROM SetLeft l WHERE NOT EXISTS (SELECT r.tag FROM SetRight r WHERE r.v = l.v);
 END;\n`;
 function run(mode, sql) {
   const dir = path.join(root, mode);
@@ -105,15 +117,21 @@ for (const name of ['intersection', 'intersection_all']) expected[name] = {
 for (const name of ['difference', 'difference_all']) expected[name] = {
   v: ['set_left.v:DIRECT', ...membership], tag: ['set_left.tag:DIRECT', ...membership]
 };
+for (const name of ['in_sink', 'not_in_sink', 'exists_sink', 'not_exists_sink']) expected[name] = {
+  v: ['set_left.v:DIRECT', 'set_left.v:INDIRECT', 'set_right.v:INDIRECT'],
+  tag: ['set_left.tag:DIRECT', 'set_left.v:INDIRECT', 'set_right.v:INDIRECT']
+};
 function verify(dir) {
   const rows = {detail: psql(`SELECT * FROM ${schema}.detail ORDER BY order_id`), summary: psql(`SELECT * FROM ${schema}.summary ORDER BY tier`)};
-  for (const name of ['intersection', 'intersection_all', 'difference', 'difference_all']) {
+  for (const name of Object.keys(expected).filter(name => name !== 'detail' && name !== 'summary')) {
     rows[name] = psql(`SELECT COALESCE(v::text,'NULL') || '|' || tag FROM ${schema}.${name} ORDER BY 1`);
   }
   fs.writeFileSync(path.join(dir, 'rows.json'), JSON.stringify(rows, null, 2));
   assert.deepEqual(rows, {detail: '1|gold|105\n3|gold|55', summary: 'gold|160|2',
     intersection: '1|a\nNULL|z', intersection_all: '1|a\n1|a\nNULL|z',
-    difference: '2|b\n3|c', difference_all: '1|a\n2|b\n3|c'});
+    difference: '2|b\n3|c', difference_all: '1|a\n2|b\n3|c',
+    in_sink: '1|a\n1|a\n1|a\n2|b', not_in_sink: '',
+    exists_sink: '1|a\n1|a\n1|a\n2|b', not_exists_sink: '3|c\nNULL|z'});
   const events = fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
   const starts = events.filter(e => e.eventType === 'START');
   const ends = events.filter(e => e.eventType === 'COMPLETE');
@@ -134,7 +152,7 @@ function verify(dir) {
     return i.name + '->' + o.name;
   })).sort();
   const expectedPairs = ['customers', 'orders'].flatMap(i => ['detail', 'summary'].map(o => identity(i) + '->' + identity(o)));
-  expectedPairs.push(...['set_left', 'set_right'].flatMap(i => ['intersection', 'intersection_all', 'difference', 'difference_all'].map(o => identity(i) + '->' + identity(o))));
+  expectedPairs.push(...['set_left', 'set_right'].flatMap(i => Object.keys(expected).filter(o => o !== 'detail' && o !== 'summary').map(o => identity(i) + '->' + identity(o))));
   assert.deepEqual(pairs, expectedPairs.sort());
   for (const [tableName, fields] of Object.entries(expected)) {
     const actual = event.outputs.find(o => o.name === identity(tableName)).facets.columnLineage.fields;

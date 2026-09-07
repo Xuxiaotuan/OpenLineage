@@ -1,7 +1,7 @@
 <!-- Copyright 2018-2026 contributors to the OpenLineage project -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# PostgreSQL physical identity and set-operation acceptance
+# PostgreSQL physical identity, set-operation and membership-subquery acceptance
 
 This opt-in test runs the real paired SQL Client against an isolated PostgreSQL
 container. It is not a mocked metadata visitor test or Kubernetes/HA acceptance.
@@ -30,10 +30,11 @@ retains SQL, raw events, process logs, database result rows and the compiled pla
 No container or database cleanup is automated.
 
 The same StatementSet exercises a filtered JOIN and aggregation plus INTERSECT,
-INTERSECT ALL, EXCEPT and EXCEPT ALL. Duplicate rows, NULLs and equal keys with
+INTERSECT ALL, EXCEPT, EXCEPT ALL, IN, NOT IN, EXISTS and NOT EXISTS.
+Duplicate rows, NULLs and equal keys with
 different second-column values distinguish whole-row membership and multiplicity.
-Checks require four physical source identities, six physical output identities,
-twelve precise table edges, all fourteen output fields' exact DIRECT/INDIRECT
+Checks require four physical source identities, ten physical output identities,
+twenty precise table edges, all twenty-two output fields' exact DIRECT/INDIRECT
 dependencies, exact PostgreSQL output rows, and matching START/COMPLETE run IDs.
 The table aliases deliberately differ from physical table names. Every field
 reference must match a published physical input identity and PostgreSQL namespace.
@@ -42,6 +43,10 @@ COMPLETE is a runtime status snapshot rather than another graph publication;
 it must match the run ID and report COMPLETE for both table and column status.
 The shared `(1, 'a')` row occurs three times on the left and twice on the right:
 INTERSECT returns it once, INTERSECT ALL twice, EXCEPT never, and EXCEPT ALL once.
+The membership subqueries compare only `v`, not `tag`. The right-side NULL makes
+NOT IN return no rows; NOT EXISTS retains `(3, 'c')` and `(NULL, 'z')`.
+EXISTS selects the unused right-side `tag` deliberately: it must not become a
+field dependency. Both IN and EXISTS retain three left duplicates and `(2, 'b')`.
 
 The plan is then compiled without submitting, and restored in a fresh SQL Client
 process without the original table/view DDL. The same assertions must pass; the
