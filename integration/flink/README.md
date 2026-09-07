@@ -256,6 +256,44 @@ real Kafka/Paimon connectors, remote transport delivery or SQL Gateway deploymen
 
 ### SQL Client distribution acceptance
 
+#### Latest submission-identity acceptance (2026-09-07, Asia/Shanghai)
+
+The fresh `submission-*` Kubernetes resources ran clean Flink
+`c895962138fbf3ed92a2c07a8968081f09832adb` with OpenLineage
+`f5ab758f182a79a102d242159459f103623929bd`. Image
+`flink-lineage-local:submission-20260907` has ID
+`sha256:4056814d8274646093a929ba04abb6ecd8e25c3765281cc69fdface34b0f56f6`;
+the adapter SHA-256 is
+`e4b065260442df8c3a0efa8fc560fc7e3e70790cf2e4d94cc9dd3fd13e793d5b`.
+The distribution was rebuilt with forced Jar creation; provenance and hashes of
+all 14 distribution-lib Jars are retained with the raw evidence.
+
+All ten cases passed exact data and applicable table/column relationships,
+remote job-state checks, and matching START/terminal run IDs: direct submission,
+column metadata loss, legacy metadata loss, mixed sinks, mixed restore,
+partial-table restore, complex batch restore, cancellation, runtime CAST failure,
+and Operator Application mode. The complex restore job was
+`a5fbff12f5599c13762086742d9a2b04`; the Application job was
+`0ffa4b7e3b1ebc17e965739b895139a7`. Expected cancellation and failure are verified
+negative cases, not successful business jobs.
+
+A separate complete Collector outage left job
+`33cbe02256e05964f14edcde16c5e67e` FINISHED with exact CSV rows and zero received
+events. The event count stayed at 29, and the Collector was restored to 1/1.
+This proves execution isolation, not reliable delivery. Only the new completed
+Session was scaled to zero; its evidence PVC remains and older resources were
+not changed. Session JobManager memory was 1 GiB to fit the local test node.
+
+Evidence is local at `build/submission-poc-20260907/`, including `summary.json`,
+manifests, SQL, events, output rows, logs, build provenance and library hashes.
+The paired local suites passed 105 adapter tests, 182 Planner tests, 26 client
+tests and 8 Sink recovery tests before this deployment. A subsequent JavaDoc-only
+format repair passed Checkstyle and Spotless across all six changed Flink modules.
+The fresh [remote CI run](https://github.com/Xuxiaotuan/flink/actions/runs/34096566618)
+is separate evidence; deployment success does not establish that all CI jobs pass.
+This matrix does not exercise fixed-JobID resubmission, live JobManager HA,
+network retry, savepoints, real Kafka/JDBC/Paimon services, or unsupported SQL.
+
 #### Verified compatibility and isolation repair (2026-09-07, Asia/Shanghai)
 
 The image `flink-lineage-local:repaired-20260907` was built from clean Flink
