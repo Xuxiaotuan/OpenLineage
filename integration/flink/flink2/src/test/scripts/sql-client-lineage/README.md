@@ -25,7 +25,7 @@ Build the adapter with the paired local Maven artifacts, then run from
 ```sh
 ./gradlew verifyFlink2ColumnLineageJar
 node flink2/src/test/scripts/sql-client-lineage/run.cjs \
-  /absolute/path/to/flink/flink-dist/target/flink-2.4-SNAPSHOT-bin/flink-2.4-SNAPSHOT \
+  /absolute/path/to/flink/flink-dist/target/flink-2.2-SNAPSHOT-bin/flink-2.2-SNAPSHOT \
   build/libs/openlineage-flink-1.54.0-SNAPSHOT.jar
 ```
 

@@ -7,7 +7,21 @@ for more details.
 
 ## Native column lineage in this branch
 
-This development branch pairs with the modified Flink `2.4-SNAPSHOT` build that
+This is the Flink 2.2 backport branch. Dated results below describe earlier
+2.4 development runs; they are not acceptance evidence for this backport.
+The runtime and restore checks must use the paired 2.2 artifacts.
+
+Backport validation on 2026-09-08: the Flink 2.2 native-lineage targeted tests
+passed (67 runtime/client tests and 193 Planner tests, including focused reruns),
+as did all 105 tests in this integration's `:flink2:test` suite and
+`verifyFlink2ColumnLineageJar`. The rebuilt 2.2 distribution also passed the
+SQL Client direct, incomplete/legacy metadata, mixed-sink and fresh-process
+restore checks. PostgreSQL direct and restored execution passed exact row,
+physical-identity, 20 table-edge and 22 output-field dependency assertions.
+These checks do not establish arbitrary SQL, cross-version plan compatibility,
+HA or production readiness. Kubernetes validation is tracked separately.
+
+This development branch pairs with the modified Flink `2.2-SNAPSHOT` build that
 provides `LineageGraph.columnRelations()`. Install that Flink build and its test
 artifacts into the local Maven repository before building this integration.
 The defaults in `gradle.properties` select the paired version; no version
@@ -255,7 +269,7 @@ These are synthetic test artifacts, not production data or a deployable UDF Jar.
 `BatchExecAdaptiveJoin` with versioned metadata and JSON serialization/restore
 support. Before this repair the batch restore test failed with `Missing type`.
 Rebuild and install that paired Planner before running these tests; an older
-2.4-SNAPSHOT artifact without the repair is insufficient. The batch test asserts
+2.2-SNAPSHOT artifact without the repair is insufficient. The batch test asserts
 that the saved plan still contains `batch-exec-adaptive-join_1`, then restores it
 from disk and checks actual data and all field dependencies. No adaptive optimizer
 setting is disabled. This is compiled-plan recovery, not checkpoint/savepoint recovery.
