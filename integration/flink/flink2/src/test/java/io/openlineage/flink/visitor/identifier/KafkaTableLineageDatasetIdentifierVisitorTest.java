@@ -20,6 +20,8 @@ import org.apache.flink.streaming.api.lineage.LineageDataset;
 import org.apache.flink.streaming.api.lineage.LineageDatasetFacet;
 import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.ContextResolvedTable;
+import org.apache.flink.table.catalog.ObjectIdentifier;
+import org.apache.flink.table.catalog.ResolvedSchema;
 import org.apache.flink.table.planner.lineage.TableLineageDataset;
 import org.apache.flink.table.planner.lineage.TableLineageDatasetImpl;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,7 +40,9 @@ class KafkaTableLineageDatasetIdentifierVisitorTest {
   @BeforeEach
   void setup() {
     when(contextResolvedTable.getTable()).thenReturn(catalogBaseTable);
-    when(contextResolvedTable.getIdentifier().asSummaryString()).thenReturn("tableName");
+    when(contextResolvedTable.getResolvedSchema()).thenReturn(ResolvedSchema.of());
+    when(contextResolvedTable.getIdentifier())
+        .thenReturn(ObjectIdentifier.of("catalog", "database", "tableName"));
 
     table =
         new TableLineageDatasetImpl(
@@ -93,7 +97,8 @@ class KafkaTableLineageDatasetIdentifierVisitorTest {
 
     assertThat(datasetIdentifiers.iterator().next().getSymlinks())
         .containsExactlyInAnyOrder(
-            new Symlink("tableName", "kafka://localhost:1000", SymlinkType.TABLE));
+            new Symlink(
+                "`catalog`.`database`.`tableName`", "kafka://localhost:1000", SymlinkType.TABLE));
   }
 
   @Test
