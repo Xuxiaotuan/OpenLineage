@@ -229,7 +229,9 @@ class ColumnLineageStatementSetE2ETest {
         .isEqualTo(
             OBJECT_MAPPER.readTree(
                 "["
-                    + input("PrunedSource", "value", "DIRECT")
+                    + "{\"namespace\":\"flink://catalog/default_catalog\","
+                    + "\"name\":\"`default_catalog`.`default_database`.`PrunedSource`\","
+                    + "\"field\":\"value\",\"transformations\":[{\"type\":\"DIRECT\"}]}"
                     + ","
                     + input("LiveSource", "value", "DIRECT")
                     + "]"));
@@ -254,9 +256,18 @@ class ColumnLineageStatementSetE2ETest {
     legacyPlan.execute().await(30, TimeUnit.SECONDS);
     assertThat(miniCluster.listJobs().get()).hasSize(jobsBefore + 1);
     List<RunEvent> events = LineageTestUtils.fromFile(EVENTS_FILE.toString());
-    assertThat(events)
+    List<RunEvent> lifecycle =
+        events.stream()
+            .filter(
+                event ->
+                    event.getEventType() == EventType.START
+                        || event.getEventType() == EventType.COMPLETE)
+            .collect(java.util.stream.Collectors.toList());
+    assertThat(lifecycle)
         .extracting(RunEvent::getEventType)
-        .contains(EventType.START, EventType.COMPLETE);
+        .containsExactlyInAnyOrder(EventType.START, EventType.COMPLETE);
+    assertThat(lifecycle.get(0).getRun().getRunId())
+        .isEqualTo(lifecycle.get(1).getRun().getRunId());
     for (RunEvent event : events) {
       JsonNode status =
           OBJECT_MAPPER.valueToTree(event).path("run").path("facets").path("flink_lineage");

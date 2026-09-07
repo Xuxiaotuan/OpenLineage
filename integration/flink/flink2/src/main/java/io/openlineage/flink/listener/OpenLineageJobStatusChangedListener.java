@@ -10,6 +10,7 @@ import io.openlineage.client.OpenLineage.RunEvent;
 import io.openlineage.client.OpenLineage.RunEvent.EventType;
 import io.openlineage.client.OpenLineage.RunEventBuilder;
 import io.openlineage.client.OpenLineageClientUtils;
+import io.openlineage.client.utils.UUIDUtils;
 import io.openlineage.flink.api.OpenLineageContext;
 import io.openlineage.flink.api.OpenLineageContext.JobIdentifier;
 import io.openlineage.flink.api.OpenLineageContextFactory;
@@ -23,19 +24,24 @@ import io.openlineage.flink.facets.FlinkLineageFacet;
 import io.openlineage.flink.tracker.OpenLineageContinousJobTracker;
 import io.openlineage.flink.util.JobStatusUtil;
 import io.openlineage.flink.visitor.Flink2VisitorFactory;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.common.JobID;
 import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.core.execution.DefaultJobExecutionStatusEvent;
 import org.apache.flink.core.execution.JobStatusChangedEvent;
 import org.apache.flink.core.execution.JobStatusChangedListener;
 import org.apache.flink.core.execution.JobStatusChangedListenerFactory.Context;
+import org.apache.flink.core.execution.SubmissionIdentity;
 import org.apache.flink.runtime.util.EnvironmentInformation;
 import org.apache.flink.streaming.runtime.execution.JobCreatedEvent;
 
@@ -46,9 +52,9 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
   private final OpenLineageContext context;
   private final Flink2VisitorFactory visitorFactory;
   private final String jobsApiUrl;
-  private final java.util.Map<org.apache.flink.api.common.JobID, JobState> jobs =
+  private final java.util.Map<SubmissionKey, JobState> jobs =
       new java.util.concurrent.ConcurrentHashMap<>();
-  private final java.util.Set<org.apache.flink.api.common.JobID> completedJobs =
+  private final java.util.Set<SubmissionKey> completedJobs =
       java.util.concurrent.ConcurrentHashMap.newKeySet();
 
   public OpenLineageJobStatusChangedListener(Context context, Flink2VisitorFactory visitorFactory) {
@@ -78,6 +84,7 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
   @Override
   @SuppressWarnings("PMD.AvoidCatchingThrowable")
   public synchronized void onEvent(JobStatusChangedEvent event) {
+    SubmissionKey key = SubmissionKey.from(event);
     boolean terminal =
         event instanceof DefaultJobExecutionStatusEvent
             && List.of(EventType.COMPLETE, EventType.FAIL, EventType.ABORT)
@@ -86,12 +93,12 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
                         ((DefaultJobExecutionStatusEvent) event).newStatus()));
     JobState terminalState = null;
     if (terminal) {
-      if (!completedJobs.add(event.jobId())) {
+      if (!completedJobs.add(key)) {
         return;
       }
-      terminalState = jobs.remove(event.jobId());
+      terminalState = jobs.remove(key);
       if (terminalState == null) {
-        terminalState = new JobState();
+        terminalState = new JobState(key);
       }
       terminalState.stopTracking();
     }
@@ -105,16 +112,14 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
                 log.warn("Unsupported event: {}", event.getClass());
                 return null;
               }
-              if (!terminal && completedJobs.contains(event.jobId())) {
+              if (!terminal && completedJobs.contains(key)) {
                 return null;
               }
               JobState state =
-                  terminal
-                      ? capturedTerminalState
-                      : jobs.computeIfAbsent(event.jobId(), ignored -> new JobState());
+                  terminal ? capturedTerminalState : jobs.computeIfAbsent(key, JobState::new);
               synchronized (state) {
-                if (!terminal && completedJobs.contains(event.jobId())) {
-                  jobs.remove(event.jobId(), state);
+                if (!terminal && completedJobs.contains(key)) {
+                  jobs.remove(key, state);
                   state.stopTracking();
                   return null;
                 }
@@ -132,14 +137,40 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
             });
   }
 
+  @Value
+  private static class SubmissionKey {
+    JobID jobId;
+    String submissionId;
+
+    static SubmissionKey from(JobStatusChangedEvent event) {
+      return new SubmissionKey(
+          event.jobId(),
+          event instanceof SubmissionIdentity ? ((SubmissionIdentity) event).submissionId() : null);
+    }
+  }
+
   private final class JobState {
-    private final OpenLineageContext context =
-        OpenLineageJobStatusChangedListener.this.context.toBuilder().jobId(null).build();
-    private final LineageGraphConverter graphConverter =
-        new LineageGraphConverter(context, visitorFactory);
-    private final OpenLineageContinousJobTracker tracker =
-        new OpenLineageContinousJobTracker(
-            Duration.ofSeconds(context.getConfig().getTrackingIntervalInSeconds()), jobsApiUrl);
+    private final OpenLineageContext context;
+    private final LineageGraphConverter graphConverter;
+    private final OpenLineageContinousJobTracker tracker;
+
+    private JobState(SubmissionKey key) {
+      OpenLineageContext.OpenLineageContextBuilder builder =
+          OpenLineageJobStatusChangedListener.this.context.toBuilder().jobId(null);
+      if (key.submissionId != null) {
+        builder.runUuid(
+            UUIDUtils.generateStaticUUID(
+                Instant.EPOCH,
+                (key.jobId.toHexString() + ":" + key.submissionId)
+                    .getBytes(StandardCharsets.UTF_8)));
+      }
+      context = builder.build();
+      graphConverter = new LineageGraphConverter(context, visitorFactory);
+      tracker =
+          new OpenLineageContinousJobTracker(
+              Duration.ofSeconds(context.getConfig().getTrackingIntervalInSeconds()), jobsApiUrl);
+    }
+
     private FlinkLineageFacet lineageStatus;
     private boolean startObserved;
     private volatile boolean finished;
@@ -279,8 +310,8 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
     } finally {
       if (terminal) {
         state.stopTracking();
-        jobs.remove(event.jobId());
-        completedJobs.add(event.jobId());
+        jobs.remove(SubmissionKey.from(event), state);
+        completedJobs.add(SubmissionKey.from(event));
       }
     }
   }
@@ -341,7 +372,8 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
             .build();
     log.info("JobIdentifier with jobId: {}", jobId.getFlinkJobId());
     state.context.setJobId(jobId);
-    if (createdEvent.jobId() != null) {
+    // Legacy events cannot distinguish submissions that reuse a JobID.
+    if (createdEvent.jobId() != null && SubmissionKey.from(createdEvent).submissionId == null) {
       state.context.setRunUuidFromFlinkJobId(createdEvent.jobId(), java.time.Instant.EPOCH);
     }
   }

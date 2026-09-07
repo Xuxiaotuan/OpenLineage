@@ -53,6 +53,94 @@ import org.mockito.MockedConstruction;
 class OpenLineageJobStatusChangedListenerTest {
   @Test
   @SneakyThrows
+  void lateCheckpointFromPreviousSubmissionCannotEmitIntoNextRun() {
+    java.util.List<java.util.function.Consumer<io.openlineage.flink.client.CheckpointFacet>>
+        callbacks = new java.util.ArrayList<>();
+    try (MockedConstruction<OpenLineageContinousJobTracker> trackers =
+        mockConstruction(
+            OpenLineageContinousJobTracker.class,
+            (tracker, ignored) ->
+                doAnswer(
+                        call -> {
+                          callbacks.add(call.getArgument(1));
+                          return null;
+                        })
+                    .when(tracker)
+                    .startTracking(any(), any()))) {
+      context.getConfiguration().setString("openlineage.disableCheckpointTracking", "false");
+      listener = new OpenLineageJobStatusChangedListener(context, factory);
+      JobID id = new JobID(1, 2);
+      listener.onEvent(identifiedCreated(id, "first"));
+      listener.onEvent(identifiedTerminal(id, "first"));
+      listener.onEvent(identifiedCreated(id, "second"));
+      callbacks.get(0).accept(new io.openlineage.flink.client.CheckpointFacet(1, 0, 0, 0, 1));
+      listener.onEvent(identifiedTerminal(id, "second"));
+      assertThat(readEvents())
+          .extracting(RunEvent::getEventType)
+          .containsExactly(
+              EventType.START, EventType.COMPLETE, EventType.START, EventType.COMPLETE);
+    }
+  }
+
+  @Test
+  @SneakyThrows
+  void reusedJobIdKeepsSubmissionLifecyclesAndLateEventsSeparate() {
+    listener = new OpenLineageJobStatusChangedListener(context, factory);
+    JobID id = new JobID(1, 2);
+    listener.onEvent(identifiedCreated(id, "first"));
+    listener.onEvent(identifiedTerminal(id, "first"));
+    listener.onEvent(identifiedCreated(id, "second"));
+    listener.onEvent(identifiedTerminal(id, "first"));
+    listener.onEvent(identifiedCreated(id, "first"));
+    listener.onEvent(identifiedTerminal(id, "second"));
+    List<RunEvent> events = readEvents();
+    assertThat(events)
+        .extracting(RunEvent::getEventType)
+        .containsExactly(EventType.START, EventType.COMPLETE, EventType.START, EventType.COMPLETE);
+    assertThat(events.get(0).getRun().getRunId()).isEqualTo(events.get(1).getRun().getRunId());
+    assertThat(events.get(2).getRun().getRunId()).isEqualTo(events.get(3).getRun().getRunId());
+    assertThat(events.get(0).getRun().getRunId()).isNotEqualTo(events.get(2).getRun().getRunId());
+  }
+
+  @Test
+  @SneakyThrows
+  void separateClientAndJobManagerListenersAgreeAcrossRecovery() {
+    JobID id = new JobID(1, 2);
+    for (String submission : List.of("first", "second")) {
+      new OpenLineageJobStatusChangedListener(context, factory)
+          .onEvent(identifiedCreated(id, submission));
+      new OpenLineageJobStatusChangedListener(context, factory)
+          .onEvent(identifiedTerminal(id, submission));
+    }
+    List<RunEvent> events = readEvents();
+    assertThat(events).hasSize(4);
+    assertThat(events.get(0).getRun().getRunId()).isEqualTo(events.get(1).getRun().getRunId());
+    assertThat(events.get(2).getRun().getRunId()).isEqualTo(events.get(3).getRun().getRunId());
+    assertThat(events.get(0).getRun().getRunId()).isNotEqualTo(events.get(2).getRun().getRunId());
+  }
+
+  private JobCreatedEvent identifiedCreated(JobID id, String submission) {
+    return new org.apache.flink.streaming.runtime.execution.DefaultJobCreatedEvent(
+        id,
+        "reused-job",
+        created(id, "reused-job", "COMPLETE").lineageGraph(),
+        org.apache.flink.api.common.RuntimeExecutionMode.BATCH,
+        submission);
+  }
+
+  private DefaultJobExecutionStatusEvent identifiedTerminal(JobID id, String submission) {
+    return new DefaultJobExecutionStatusEvent(
+        id, "reused-job", JobStatus.RUNNING, JobStatus.FINISHED, null, Map.of(), submission);
+  }
+
+  private List<RunEvent> readEvents() throws IOException {
+    return Files.readAllLines(Path.of(eventFileLocation)).stream()
+        .map(OpenLineageClientUtils::runEventFromJson)
+        .collect(Collectors.toList());
+  }
+
+  @Test
+  @SneakyThrows
   void createdCallbackQueuedBeforeTerminalDoesNotRestartTracking() {
     CircuitBreaker breaker = mock(CircuitBreaker.class);
     java.util.List<Callable<?>> callbacks = new java.util.ArrayList<>();

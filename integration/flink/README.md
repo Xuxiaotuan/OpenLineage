@@ -67,7 +67,18 @@ the lineage statuses.
 
 Submission-side START and JobManager terminal events can use different listener
 instances. This POC derives the OpenLineage run UUID deterministically from the
-Flink JobID, so the same JobID identifies the same run on both sides. A snapshot
+pair `(Flink JobID, submissionId)`, so both sides identify the same submission.
+The paired Flink build generates an internal submission ID before each
+`RestClusterClient.submitJob`, `MiniCluster.submitJob`, or Embedded executor
+submission, including repeated calls with the same plan object. It snapshots the
+submitted plan and captures the ID for the client notification. REST plan
+serialization now finishes within the submission call; upload and request
+completion remain asynchronous, and serialization failures are returned through
+the submission future. Transport retries reuse the same ID; persisted JobManager
+recovery preserves its configuration,
+and an Embedded HA reconnect does not create a new submission. Calling submit
+again is a new submission attempt, not an internal transport retry. This does not
+change Flink's existing rejection of duplicate JobIDs in a cluster. A snapshot
 of lineage completeness is carried in internal job configuration and exposed
 through `DefaultJobExecutionStatusEvent.getLineageStatus()` for the terminal
 listener. This correlates lifecycle identity and metadata status; it does not
@@ -76,12 +87,18 @@ fresh Kubernetes Session and Application runs verified matching START/COMPLETE
 run IDs and completeness snapshots on 2026-09-06. Those results predate the
 per-dataset observation changes and are not acceptance evidence for this revision.
 
-Listener state is isolated by Flink JobID. Only JobCreated produces START;
-INITIALIZING does not synthesize a second, metadata-free START. COMPLETE, FAIL
+Listener state and completed-event suppression are isolated by `(JobID, submissionId)`.
+Late events from an earlier submission cannot remove or update the later submission.
+Only JobCreated produces START; INITIALIZING does not synthesize a second,
+metadata-free START. COMPLETE, FAIL
 and ABORT stop checkpoint tracking even if event construction or transport fails.
 This is listener-local duplicate suppression, not distributed exactly-once delivery.
-Reusing a fixed JobID for different submissions is outside the current run-identity
-contract: such submissions are not guaranteed distinct OpenLineage run IDs.
+The adapter requires the paired custom Flink build containing `SubmissionIdentity`;
+this is not binary compatibility with older or stock Flink distributions.
+Legacy constructors and events without a submission ID in that paired build
+retain JobID-only correlation and cannot distinguish reuse of a fixed JobID. The paired custom
+stack supplies identity on both created and runtime status events; mixed
+identified and legacy events cannot be correlated reliably.
 
 Successful submission does not guarantee lineage availability or transport
 delivery. Performance optimization and benchmarking are outside this POC's scope;
@@ -142,10 +159,13 @@ including definitions of temporary tables. Protect compiled plans as sensitive
 artifacts. These plans require `table.plan.compile.catalog-objects=ALL` (the
 default) to retain lineage; `SCHEMA` and `IDENTIFIER` policies are respected and
 complete lineage is unavailable when snapshots cannot be captured. Snapshotting
-supports source, input-format and legacy source-function providers. Providers
-that require executing a DataStream/transformation to
-obtain their identity, or ambiguous definitions for the same pruned table,
-remain explicit lineage errors, not execution vetoes. A missing lineage source
+uses metadata only: an already available lineage vertex provider supplies identity;
+otherwise the snapshot explicitly uses a logical catalog namespace. It does not
+construct a runtime provider or execute a DataStream/transformation to discover
+identity. Recovered snapshots preserve their recorded namespace, including
+historical snapshots. `COMPLETE` does not certify that a logical dataset identity
+has been verified against a physical system. Ambiguous definitions for the same
+pruned table remain explicit lineage errors, not execution vetoes. A missing lineage source
 or invalid lineage field makes the affected output dataset's column lineage
 unavailable. Independently validated logical table metadata is preserved; when
 that evidence is missing, recovered runtime tables are only `PARTIAL`. A snapshot
