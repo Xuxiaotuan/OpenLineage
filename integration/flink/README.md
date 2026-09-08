@@ -11,7 +11,63 @@ This is the Flink 2.2 backport branch. Dated results below describe earlier
 2.4 development runs; they are not acceptance evidence for this backport.
 The runtime and restore checks must use the paired 2.2 artifacts.
 
-Backport validation on 2026-09-08: the Flink 2.2 native-lineage targeted tests
+### POC fixes and delivery boundary (2026-09-08)
+
+The paired 2.2 fix adds whole-row INDIRECT dependencies for `UNION DISTINCT`;
+`UNION ALL` continues to merge only corresponding value origins and existing
+row dependencies. The REST client also deletes a partially serialized plan when
+serialization fails, preserving the original failure (and any cleanup failure
+as a suppressed exception).
+
+There is one enabled observation policy, not a strict/best-effort mode selector.
+The emergency switch `table.lineage.enabled` defaults to `true`. Set it to
+`false` in the submitting TableEnvironment/SQL session to skip the new logical
+extraction and binding. Sink translation also ignores native column/logical-table
+metadata in an already compiled plan while the switch is off. Existing runtime
+source/sink inventory, listener lifecycle events and submission identity remain;
+this switch does **not** turn the custom distribution into stock Flink, suppress
+all events, or erase metadata from a previously saved plan.
+
+Flink 2 event delivery now uses a single ordered, bounded queue (1024 waiting
+events) per adapter classloader. Listener callbacks still construct events
+synchronously, but no longer wait for transport I/O. A slow transport can delay
+other queued deliveries, not make the callback wait for that transport. Queue
+rejection is logged with run ID and event type and never uses caller-runs or
+blocking enqueue. The sender is a daemon and exits after 30 idle seconds.
+
+Delivery is still **best effort**, not a durable outbox: queue overflow, process
+exit, exhausted transport retries or permanent transport errors can lose events.
+There is no adapter replay after START failure or a listener/JM restart. Duplicate
+terminal callbacks remain suppressed even if the first delivery fails. Transport
+timeouts/retries are transport-specific; HTTP defaults to a 5000 ms timeout, not
+a universal total-delivery deadline. Keep short-lived submitting processes alive
+until the collector has received START; returning from submission is not a
+delivery acknowledgement. `completedJobs` still has no retention bound and is a
+known long-running Session/Gateway limitation, outside this short-lived POC.
+
+`COMPLETE` describes validated logical dependencies within the supported Planner
+model. It does not mean physical per-record provenance, UDF-body inspection,
+independent temporary-view nodes, or reliable event delivery.
+
+Remote CI inspected for the previous 2.2 commits: Flink `20cff962` run
+[34145275978](https://github.com/Xuxiaotuan/flink/actions/runs/34145275978)
+passed compile, basic QA, core, connect, misc, packaging and two E2E groups, but
+failed table, tests and Python groups. The public annotations only expose exit
+code 1; root causes have not been established. OpenLineage `41ef7620` workflows
+were skipped. These are neither the old 2.4 CI result nor proof that the new
+fix commits have green full CI. Local targeted tests must not be reported as
+full CI, K8s reacceptance, HA/savepoint compatibility, or production approval.
+
+Local verification for these fixes: 164 targeted Flink tests (22 REST client,
+100 Batch/Streaming extractor, 42 propagation tests); 109 OpenLineage Flink 2
+tests and the shaded-Jar boundary check. The new MiniCluster test runs eight
+UNION DISTINCT combinations (Batch/Streaming, direct/restored, enabled/disabled),
+checks exact duplicate/NULL sink rows and exact field dependency roles. Fault
+tests cover slow sends, concurrent job callbacks, full-queue rejection and a
+real HTTP collector rejecting START followed by successful later delivery.
+These tests establish the documented loss boundary, not reliable replay.
+
+Earlier backport validation on 2026-09-08: the Flink 2.2 native-lineage targeted tests
 passed (67 runtime/client tests and 193 Planner tests, including focused reruns),
 as did all 105 tests in this integration's `:flink2:test` suite and
 `verifyFlink2ColumnLineageJar`. The rebuilt 2.2 distribution also passed the

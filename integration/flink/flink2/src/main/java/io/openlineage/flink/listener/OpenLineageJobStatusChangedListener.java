@@ -49,6 +49,21 @@ import org.apache.flink.streaming.runtime.execution.JobCreatedEvent;
 public class OpenLineageJobStatusChangedListener implements JobStatusChangedListener {
   public static final String DEFAULT_NAMESPACE = "flink-jobs";
   public static final String FLINK_JOB_FACET_KEY = "flink_job";
+  // One bounded sender per adapter classloader. Idle daemon threads do not retain a client JVM.
+  // This is best effort: JVM exit and a full queue can lose events.
+  private static final java.util.concurrent.Executor DELIVERY =
+      new java.util.concurrent.ThreadPoolExecutor(
+          0,
+          1,
+          30,
+          java.util.concurrent.TimeUnit.SECONDS,
+          new java.util.concurrent.ArrayBlockingQueue<>(1024),
+          task -> {
+            Thread thread = new Thread(task, "openlineage-flink-delivery");
+            thread.setDaemon(true);
+            return thread;
+          });
+  private final java.util.concurrent.Executor delivery;
   private final OpenLineageContext context;
   private final Flink2VisitorFactory visitorFactory;
   private final String jobsApiUrl;
@@ -58,6 +73,7 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
       java.util.concurrent.ConcurrentHashMap.newKeySet();
 
   public OpenLineageJobStatusChangedListener(Context context, Flink2VisitorFactory visitorFactory) {
+    this.delivery = DELIVERY;
     this.context =
         OpenLineageContextFactory.fromConfig(FlinkConfigParser.parse(context.getConfiguration()))
             .build();
@@ -76,6 +92,15 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
   @VisibleForTesting
   OpenLineageJobStatusChangedListener(
       OpenLineageContext context, Flink2VisitorFactory visitorFactory) {
+    this(context, visitorFactory, DELIVERY);
+  }
+
+  @VisibleForTesting
+  OpenLineageJobStatusChangedListener(
+      OpenLineageContext context,
+      Flink2VisitorFactory visitorFactory,
+      java.util.concurrent.Executor delivery) {
+    this.delivery = delivery;
     this.context = context;
     this.visitorFactory = visitorFactory;
     this.jobsApiUrl = "http://localhost:8081/jobs";
@@ -226,7 +251,7 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
               .build();
     }
     try {
-      state.context.getEventEmitter().emit(startEvent);
+      emit(state, startEvent);
     } catch (Exception e) {
       log.error("Emitting START event failed", e);
     }
@@ -266,7 +291,7 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
         log.debug("Emitting checkpoint event: {}", OpenLineageClientUtils.toJson(runEvent));
       }
       try {
-        state.context.getEventEmitter().emit(runEvent);
+        emit(state, runEvent);
       } catch (Exception e) {
         log.error("Emitting checkpoint event failed", e);
       }
@@ -306,13 +331,35 @@ public class OpenLineageJobStatusChangedListener implements JobStatusChangedList
                       .build())
               .build();
 
-      state.context.getEventEmitter().emit(runEvent);
+      emit(state, runEvent);
     } finally {
       if (terminal) {
         state.stopTracking();
         jobs.remove(SubmissionKey.from(event), state);
         completedJobs.add(SubmissionKey.from(event));
       }
+    }
+  }
+
+  private void emit(JobState state, RunEvent event) {
+    try {
+      delivery.execute(
+          () -> {
+            try {
+              state.context.getEventEmitter().emit(event);
+            } catch (Exception error) {
+              log.error(
+                  "OpenLineage delivery failed for run {} event {}; no adapter replay is available",
+                  event.getRun().getRunId(),
+                  event.getEventType(),
+                  error);
+            }
+          });
+    } catch (java.util.concurrent.RejectedExecutionException error) {
+      log.error(
+          "OpenLineage delivery queue full; dropping run {} event {}",
+          event.getRun().getRunId(),
+          event.getEventType());
     }
   }
 

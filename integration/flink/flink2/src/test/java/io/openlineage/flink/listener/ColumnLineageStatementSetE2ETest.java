@@ -80,10 +80,112 @@ class ColumnLineageStatementSetE2ETest {
   }
 
   @Test
+  void unionDistinctRowsAndDependenciesSurviveRestoreAndSwitch() throws Exception {
+    for (boolean batch : new boolean[] {true, false}) {
+      for (boolean restore : new boolean[] {false, true}) {
+        for (boolean enabled : new boolean[] {true, false}) {
+          Files.deleteIfExists(EVENTS_FILE);
+          TestValuesTableFactory.clearAllData();
+          TableEnvironmentImpl environment =
+              (TableEnvironmentImpl)
+                  TableEnvironmentImpl.create(
+                      (batch
+                              ? EnvironmentSettings.newInstance().inBatchMode()
+                              : EnvironmentSettings.newInstance().inStreamingMode())
+                          .withConfiguration(createConfiguration())
+                          .build());
+          Schema schema =
+              Schema.newBuilder()
+                  .column("a", DataTypes.BIGINT())
+                  .column("b", DataTypes.BIGINT())
+                  .build();
+          String left =
+              TestValuesTableFactory.registerData(
+                  List.of(Row.of(1L, 10L), Row.of(1L, 10L), Row.of(null, 20L)));
+          String right =
+              TestValuesTableFactory.registerData(
+                  List.of(Row.of(1L, 10L), Row.of(1L, 11L), Row.of(null, 20L)));
+          environment.createTemporaryTable(
+              "UnionLeft",
+              TableDescriptor.forConnector("values")
+                  .schema(schema)
+                  .option("bounded", "true")
+                  .option("data-id", left)
+                  .build());
+          environment.createTemporaryTable(
+              "UnionRight",
+              TableDescriptor.forConnector("values")
+                  .schema(schema)
+                  .option("bounded", "true")
+                  .option("data-id", right)
+                  .build());
+          environment.createTemporaryTable(
+              "UnionSink",
+              TableDescriptor.forConnector("values")
+                  .schema(schema)
+                  .option("sink-insert-only", "false")
+                  .build());
+          String sql =
+              "INSERT INTO UnionSink SELECT a,b FROM UnionLeft UNION SELECT a,b FROM UnionRight";
+          String plan = restore ? environment.compilePlanSql(sql).asJsonString() : null;
+          environment
+              .getConfig()
+              .getConfiguration()
+              .setString("table.lineage.enabled", Boolean.toString(enabled));
+          if (restore) {
+            environment
+                .loadPlan(PlanReference.fromJsonString(plan))
+                .execute()
+                .await(30, TimeUnit.SECONDS);
+          } else {
+            environment.executeSql(sql).await(30, TimeUnit.SECONDS);
+          }
+          awaitEvents();
+          assertThat(TestValuesTableFactory.getResults("UnionSink"))
+              .containsExactlyInAnyOrder(Row.of(1L, 10L), Row.of(1L, 11L), Row.of(null, 20L));
+          RunEvent start =
+              LineageTestUtils.fromFile(EVENTS_FILE.toString()).stream()
+                  .filter(event -> event.getEventType() == EventType.START)
+                  .findFirst()
+                  .orElseThrow();
+          JsonNode status =
+              OBJECT_MAPPER.valueToTree(start).path("run").path("facets").path("flink_lineage");
+          OutputDataset output = start.getOutputs().get(0);
+          if (!enabled) {
+            assertThat(status.path("columnStatus").asText()).isEqualTo("UNAVAILABLE");
+            assertThat(output.getFacets().getColumnLineage()).isNull();
+            continue;
+          }
+          assertThat(status.path("columnStatus").asText()).isEqualTo("COMPLETE");
+          assertThat(status.path("tableStatus").asText()).isEqualTo("COMPLETE");
+          JsonNode fields =
+              OBJECT_MAPPER.valueToTree(output.getFacets().getColumnLineage()).path("fields");
+          for (String field : List.of("a", "b")) {
+            String other = field.equals("a") ? "b" : "a";
+            assertThat(fields.path(field).path("inputFields"))
+                .containsExactlyInAnyOrderElementsOf(
+                    OBJECT_MAPPER.readTree(
+                        "["
+                            + input("UnionLeft", field, "DIRECT", "INDIRECT")
+                            + ","
+                            + input("UnionRight", field, "DIRECT", "INDIRECT")
+                            + ","
+                            + input("UnionLeft", other, "INDIRECT")
+                            + ","
+                            + input("UnionRight", other, "INDIRECT")
+                            + "]"));
+          }
+        }
+      }
+    }
+  }
+
+  @Test
   void emitsCompleteOpenLineageColumnLineageJsonForTwoSinkStatementSet() throws Exception {
     TableEnvironmentImpl environment = createEnvironment();
 
     createStatementSet(environment).execute().await(30, TimeUnit.SECONDS);
+    awaitEvents();
 
     assertThat(Files.exists(EVENTS_FILE)).isTrue();
     List<RunEvent> events = LineageTestUtils.fromFile(EVENTS_FILE.toString());
@@ -153,6 +255,7 @@ class ColumnLineageStatementSetE2ETest {
         .loadPlan(PlanReference.fromJsonString(plan.asJsonString()))
         .execute()
         .await(30, TimeUnit.SECONDS);
+    awaitEvents();
 
     RunEvent start =
         LineageTestUtils.fromFile(EVENTS_FILE.toString()).stream()
@@ -211,6 +314,7 @@ class ColumnLineageStatementSetE2ETest {
     String plan = statements.compilePlan().asJsonString();
     environment.dropTemporaryTable("PrunedSource");
     environment.loadPlan(PlanReference.fromJsonString(plan)).execute().await(30, TimeUnit.SECONDS);
+    awaitEvents();
 
     assertThat(TestValuesTableFactory.getResults("CollectedSink")).containsExactly(Row.of(7L));
     RunEvent start =
@@ -254,6 +358,7 @@ class ColumnLineageStatementSetE2ETest {
     assertThat(Files.exists(EVENTS_FILE)).isFalse();
 
     legacyPlan.execute().await(30, TimeUnit.SECONDS);
+    awaitEvents();
     assertThat(miniCluster.listJobs().get()).hasSize(jobsBefore + 1);
     List<RunEvent> events = LineageTestUtils.fromFile(EVENTS_FILE.toString());
     List<RunEvent> lifecycle =
@@ -317,8 +422,10 @@ class ColumnLineageStatementSetE2ETest {
           .loadPlan(PlanReference.fromJsonString(plan))
           .execute()
           .await(30, TimeUnit.SECONDS);
+      awaitEvents();
     } else {
       statements.execute().await(30, TimeUnit.SECONDS);
+      awaitEvents();
     }
     assertThat(TestValuesTableFactory.getResults("IndependentX")).containsExactly(Row.of(11L));
     assertThat(TestValuesTableFactory.getResults("IndependentY")).containsExactly(Row.of(12L));
@@ -355,6 +462,18 @@ class ColumnLineageStatementSetE2ETest {
           .isEqualTo(
               OBJECT_MAPPER.readTree("[" + input(sources[i], "a", "DIRECT", "INDIRECT") + "]"));
     }
+  }
+
+  private static void awaitEvents() {
+    org.awaitility.Awaitility.await()
+        .atMost(10, TimeUnit.SECONDS)
+        .untilAsserted(
+            () -> {
+              assertThat(Files.exists(EVENTS_FILE)).isTrue();
+              assertThat(LineageTestUtils.fromFile(EVENTS_FILE.toString()))
+                  .extracting(RunEvent::getEventType)
+                  .contains(EventType.START, EventType.COMPLETE);
+            });
   }
 
   private static StatementSet createStatementSet(TableEnvironmentImpl environment) {
