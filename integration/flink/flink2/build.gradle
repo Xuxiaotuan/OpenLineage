@@ -123,6 +123,7 @@ def commonTestConfiguration = {
 }
 
 test {
+    systemProperty 'listener.test.classpath', sourceSets.test.runtimeClasspath.asPath
     jvmArgs(
             "--add-opens=java.base/java.lang=ALL-UNNAMED",
             "--add-opens=java.base/java.lang.invoke=ALL-UNNAMED",

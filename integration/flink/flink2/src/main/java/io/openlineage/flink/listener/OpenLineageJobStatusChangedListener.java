@@ -49,20 +49,43 @@ import org.apache.flink.streaming.runtime.execution.JobCreatedEvent;
 public class OpenLineageJobStatusChangedListener implements JobStatusChangedListener {
   public static final String DEFAULT_NAMESPACE = "flink-jobs";
   public static final String FLINK_JOB_FACET_KEY = "flink_job";
-  // One bounded sender per adapter classloader. Idle daemon threads do not retain a client JVM.
-  // This is best effort: JVM exit and a full queue can lose events.
-  private static final java.util.concurrent.Executor DELIVERY =
-      new java.util.concurrent.ThreadPoolExecutor(
-          0,
-          1,
-          30,
-          java.util.concurrent.TimeUnit.SECONDS,
-          new java.util.concurrent.ArrayBlockingQueue<>(1024),
-          task -> {
-            Thread thread = new Thread(task, "openlineage-flink-delivery");
-            thread.setDaemon(true);
-            return thread;
-          });
+  // Normal JVM exit drains for at most five seconds; delivery remains best effort.
+  private static final java.util.concurrent.Executor DELIVERY = createDeliveryExecutor();
+
+  private static java.util.concurrent.Executor createDeliveryExecutor() {
+    java.util.concurrent.ThreadPoolExecutor executor =
+        new java.util.concurrent.ThreadPoolExecutor(
+            0,
+            1,
+            30,
+            java.util.concurrent.TimeUnit.SECONDS,
+            new java.util.concurrent.ArrayBlockingQueue<>(1024),
+            task -> {
+              Thread thread = new Thread(task, "openlineage-flink-delivery");
+              thread.setDaemon(true);
+              return thread;
+            });
+    Runtime.getRuntime()
+        .addShutdownHook(
+            new Thread(
+                () -> {
+                  executor.shutdown();
+                  try {
+                    if (executor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                      return;
+                    }
+                  } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                  }
+                  int discarded = executor.shutdownNow().size();
+                  log.warn(
+                      "OpenLineage shutdown drain did not complete; discarded {} queued events; an in-flight event may be lost",
+                      discarded);
+                },
+                "openlineage-flink-shutdown"));
+    return executor;
+  }
+
   private final java.util.concurrent.Executor delivery;
   private final OpenLineageContext context;
   private final Flink2VisitorFactory visitorFactory;

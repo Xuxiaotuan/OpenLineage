@@ -34,15 +34,18 @@ synchronously, but no longer wait for transport I/O. A slow transport can delay
 other queued deliveries, not make the callback wait for that transport. Queue
 rejection is logged with run ID and event type and never uses caller-runs or
 blocking enqueue. The sender is a daemon and exits after 30 idle seconds.
+During normal JVM shutdown, a hook stops new enqueueing and drains pending events
+for at most five seconds, then interrupts delivery and logs discarded work.
+This bounded exit delay does not add transport waits to submission callbacks.
 
 Delivery is still **best effort**, not a durable outbox: queue overflow, process
 exit, exhausted transport retries or permanent transport errors can lose events.
 There is no adapter replay after START failure or a listener/JM restart. Duplicate
 terminal callbacks remain suppressed even if the first delivery fails. Transport
 timeouts/retries are transport-specific; HTTP defaults to a 5000 ms timeout, not
-a universal total-delivery deadline. Keep short-lived submitting processes alive
-until the collector has received START; returning from submission is not a
-delivery acknowledgement. `completedJobs` still has no retention bound and is a
+a universal total-delivery deadline. Normal-exit draining is not a delivery
+acknowledgement: forced termination, hook ordering, an unreachable collector or
+drain timeout can still lose START. `completedJobs` still has no retention bound and is a
 known long-running Session/Gateway limitation, outside this short-lived POC.
 
 `COMPLETE` describes validated logical dependencies within the supported Planner
@@ -52,8 +55,12 @@ independent temporary-view nodes, or reliable event delivery.
 Remote CI inspected for the previous 2.2 commits: Flink `20cff962` run
 [34145275978](https://github.com/Xuxiaotuan/flink/actions/runs/34145275978)
 passed compile, basic QA, core, connect, misc, packaging and two E2E groups, but
-failed table, tests and Python groups. The public annotations only expose exit
-code 1; root causes have not been established. OpenLineage `41ef7620` workflows
+failed table, tests and Python groups. Detailed job logs subsequently identified
+JSON fixture trailing-newline mismatches in Table and Python; the fixtures now
+compare complete parsed JSON structures. The Tests group failed obtaining slots
+during RocksDB window recovery; the focused local rerun passed all six backend
+variants, which does not establish why the remote resource failure occurred.
+OpenLineage `41ef7620` workflows
 were skipped. These are neither the old 2.4 CI result nor proof that the new
 fix commits have green full CI. Local targeted tests must not be reported as
 full CI, K8s reacceptance, HA/savepoint compatibility, or production approval.
